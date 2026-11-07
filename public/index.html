@@ -100,6 +100,7 @@ pre{margin:0;background:var(--code);color:var(--code-t);padding:12px;border-radi
 <dialog id="dlg"></dialog>
 <div id="toast"></div>
 
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js" defer></script>
 <script>
 const $ = (s) => document.querySelector(s);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -183,6 +184,7 @@ $('#netList').onclick = (e) => {
 
 function statusBadge(n) {
   if (!n.enabled) return '<span class="badge b-bad"><i></i>已禁用</span>';
+  if (n.is_client) return '<span class="badge"><i></i>客户端</span>';
   if (!n.registered) return '<span class="badge b-warn"><i></i>待安装</span>';
   return n.online ? '<span class="badge b-ok"><i></i>在线</span>' : '<span class="badge"><i></i>离线</span>';
 }
@@ -224,6 +226,7 @@ function renderDetail() {
       </div>
       <div class="actions">
         <button class="btn sm" data-a="addNode">＋ 添加节点</button>
+        <button class="btn sm" data-a="addClient">＋ 添加手机/电脑</button>
         <button class="btn sm" data-a="editNet">编辑网络</button>
         <button class="btn sm danger" data-a="delNet">删除网络</button>
       </div>
@@ -238,18 +241,18 @@ function renderDetail() {
       ${nodes.length ? `<div class="tbl-wrap"><table>
         <thead><tr><th>节点</th><th>虚拟 IP</th><th>状态</th><th>公网端点</th><th>NAT / 路径</th><th>内网网段</th><th>最后在线</th><th></th></tr></thead>
         <tbody>${nodes.map((n) => `<tr>
-          <td><b>${esc(n.name)}</b>${n.is_hub ? '<span class="tag">Hub</span>' : ''}</td>
+          <td><b>${esc(n.name)}</b>${n.is_hub ? '<span class="tag">Hub</span>' : ''}${n.is_client ? '<span class="tag">手机/电脑</span>' : ''}</td>
           <td class="mono">${esc(n.ip)}</td>
           <td>${statusBadge(n)}</td>
           <td class="mono">${esc(n.endpoint_override || n.stun_endpoint || n.last_ip || '-')}</td>
-          <td>${pathCell(n, net)}</td>
+          <td>${n.is_client ? '-' : pathCell(n, net)}</td>
           <td class="mono">${esc(n.subnets || '-')}</td>
-          <td>${n.registered ? ago(n.last_seen) : '-'}</td>
+          <td>${n.registered && !n.is_client ? ago(n.last_seen) : '-'}</td>
           <td class="actions" data-id="${n.id}">
             ${n.enroll_token ? '<button class="btn sm pri" data-a="install">安装命令</button>' : ''}
-            <button class="btn sm" data-a="editNode">编辑</button>
+            ${n.is_client ? '<button class="btn sm pri" data-a="regen">重新生成配置</button>' : '<button class="btn sm" data-a="editNode">编辑</button>'}
             <button class="btn sm" data-a="toggle">${n.enabled ? '禁用' : '启用'}</button>
-            <button class="btn sm" data-a="reset">重置</button>
+            ${n.is_client ? '' : '<button class="btn sm" data-a="reset">重置</button>'}
             <button class="btn sm danger" data-a="delNode">删除</button>
           </td></tr>`).join('')}</tbody></table></div>`
         : '<div class="empty">还没有节点，点击“添加节点”开始组网</div>'}
@@ -264,6 +267,8 @@ $('#detail').onclick = async (e) => {
   const net = networks.find((n) => n.id === curId);
   try {
     if (a === 'addNode') nodeForm();
+    else if (a === 'addClient') clientForm();
+    else if (a === 'regen') await regenClient(node);
     else if (a === 'editNet') netForm(net);
     else if (a === 'delNet') {
       if (confirm(`确定删除网络“${net.name}”及其全部 ${nodes.length} 个节点？此操作不可恢复。`)) {
@@ -292,7 +297,7 @@ function openForm(title, body, onSubmit, okText = '保存') {
   const f = d.querySelector('form');
   f.onsubmit = async (e) => {
     e.preventDefault();
-    try { await onSubmit(new FormData(f)); d.close(); } catch (err) { f.querySelector('.err').textContent = err.message; }
+    try { await onSubmit(new FormData(f)); if (d.contains(f)) d.close(); } catch (err) { f.querySelector('.err').textContent = err.message; }
   };
   d.querySelector('[data-close]').onclick = () => d.close();
   d.showModal();
@@ -351,7 +356,92 @@ function showInstall(node) {
     try { await navigator.clipboard.writeText(cmd); toast('已复制'); } catch { toast('请手动选中复制'); }
   };
   d.querySelector('[data-close]').onclick = () => d.close();
-  d.showModal();
+  if (!d.open) d.showModal();
+}
+
+// ───────── 客户端设备（手机/电脑）：WireGuard 密钥在浏览器里生成，私钥不会上传 ─────────
+const FP = (1n << 255n) - 19n;
+const fm = (a) => ((a % FP) + FP) % FP;
+function fpow(b, e) { let r = 1n; b = fm(b); while (e > 0n) { if (e & 1n) r = fm(r * b); b = fm(b * b); e >>= 1n; } return r; }
+const leBig = (b) => { let x = 0n; for (let i = b.length - 1; i >= 0; i--) x = (x << 8n) | BigInt(b[i]); return x; };
+function x25519(k, u) { // RFC 7748
+  const kk = Uint8Array.from(k); kk[0] &= 248; kk[31] &= 127; kk[31] |= 64;
+  const uu = Uint8Array.from(u); uu[31] &= 127;
+  const s = leBig(kk), x1 = fm(leBig(uu));
+  let x2 = 1n, z2 = 0n, x3 = x1, z3 = 1n, swap = 0n;
+  for (let t = 254n; t >= 0n; t--) {
+    const kt = (s >> t) & 1n; swap ^= kt;
+    if (swap) { [x2, x3] = [x3, x2]; [z2, z3] = [z3, z2]; }
+    swap = kt;
+    const A = fm(x2 + z2), AA = fm(A * A), B = fm(x2 - z2), BB = fm(B * B), E = fm(AA - BB);
+    const C = fm(x3 + z3), D = fm(x3 - z3), DA = fm(D * A), CB = fm(C * B);
+    x3 = fm((DA + CB) ** 2n); z3 = fm(x1 * fm((DA - CB) ** 2n));
+    x2 = fm(AA * BB); z2 = fm(E * fm(AA + 121665n * E));
+  }
+  if (swap) { [x2, x3] = [x3, x2]; [z2, z3] = [z3, z2]; }
+  let v = fm(x2 * fpow(z2, FP - 2n));
+  const out = new Uint8Array(32);
+  for (let i = 0; i < 32; i++) { out[i] = Number(v & 255n); v >>= 8n; }
+  return out;
+}
+const b64 = (u8) => btoa(String.fromCharCode(...u8));
+function genKeyPair() {
+  const priv = crypto.getRandomValues(new Uint8Array(32));
+  priv[0] &= 248; priv[31] &= 127; priv[31] |= 64;
+  const base = new Uint8Array(32); base[0] = 9;
+  return { priv: b64(priv), pub: b64(x25519(priv, base)) };
+}
+
+function clientConf(info, priv) {
+  return ['[Interface]', `PrivateKey = ${priv}`, `Address = ${info.ip}/32`, '',
+    '[Peer]', `PublicKey = ${info.hub_public_key}`, `AllowedIPs = ${info.allowed_ips}`,
+    `Endpoint = ${info.endpoint}`, 'PersistentKeepalive = 25', ''].join('\n');
+}
+
+function showClientConf(name, info, conf) {
+  const d = $('#dlg');
+  const file = ('ml-' + (name.replace(/[^A-Za-z0-9_.-]/g, '') || 'client')).slice(0, 15) + '.conf';
+  d.innerHTML = `<div class="box">
+    <h3>“${esc(name)}”的接入配置</h3>
+    <p class="muted" style="margin:0">手机：打开官方 WireGuard App → “+” → 扫描二维码。电脑：在 WireGuard 里“导入隧道”选择下载的 .conf 文件。
+    <b>私钥只在这里显示这一次</b>（服务器不保存），关闭后如需重装请点“重新生成配置”。</p>
+    <div id="qr" style="background:#fff;padding:10px;border-radius:8px;width:max-content;max-width:100%;margin:4px auto"></div>
+    <pre id="cmd">${esc(conf)}</pre>
+    <p class="muted" style="margin:0">虚拟 IP: <span class="mono">${esc(info.ip)}</span> · 接入 Hub: ${esc(info.hub_name)} (${esc(info.endpoint)})</p>
+    <div class="row end"><button class="btn" id="cp">复制配置</button><button class="btn" id="dl">下载 ${esc(file)}</button><button class="btn pri" data-close>完成</button></div></div>`;
+  try {
+    new QRCode(d.querySelector('#qr'), { text: conf, width: 240, height: 240, correctLevel: QRCode.CorrectLevel.L });
+  } catch { d.querySelector('#qr').textContent = '二维码生成失败（二维码库未加载），请用下方的复制或下载'; }
+  d.querySelector('#cp').onclick = async () => {
+    try { await navigator.clipboard.writeText(conf); toast('已复制'); } catch { toast('请手动选中复制'); }
+  };
+  d.querySelector('#dl').onclick = () => {
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([conf], { type: 'text/plain' }));
+    a.download = file; document.body.appendChild(a); a.click(); a.remove();
+  };
+  d.querySelector('[data-close]').onclick = () => d.close();
+  if (!d.open) d.showModal();
+}
+
+function clientForm() {
+  openForm('添加手机/电脑', `
+    <p class="muted" style="margin:0">用于不能跑 agent 的设备：手机、Windows/macOS 电脑等，通过官方 WireGuard App 接入，经本网络的 Hub 与所有节点互通。需要本网络里已有一个在线的 Hub。</p>
+    <label>设备名称<input name="name" required maxlength="40" placeholder="例如 my-phone"></label>`, async (f) => {
+    const name = f.get('name');
+    const kp = genKeyPair();
+    const info = await api(`/networks/${curId}/clients`, 'POST', { name, public_key: kp.pub });
+    await refresh();
+    showClientConf(name, info, clientConf(info, kp.priv));
+  }, '生成配置');
+}
+
+async function regenClient(node) {
+  if (!confirm(`重新生成“${node.name}”的配置？旧配置（旧密钥）立即失效，设备需要导入新配置。`)) return;
+  const kp = genKeyPair();
+  const info = await api(`/nodes/${node.id}/client`, 'PUT', { public_key: kp.pub });
+  await refresh();
+  showClientConf(node.name, info, clientConf(info, kp.priv));
 }
 
 $('#addNet').onclick = () => netForm();

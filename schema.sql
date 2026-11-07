@@ -16,6 +16,7 @@ CREATE TABLE IF NOT EXISTS nodes (
   secret_hash       TEXT,                        -- SHA-256(node secret)，明文只在注册时返回一次
   enroll_token      TEXT,                        -- 一次性安装令牌，注册成功后清空
   is_hub            INTEGER NOT NULL DEFAULT 0,
+  is_client         INTEGER NOT NULL DEFAULT 0,    -- 1 = 手机/电脑等客户端设备（官方 WireGuard App，不跑 agent）
   subnets           TEXT NOT NULL DEFAULT '',    -- 该节点后面的内网网段，逗号分隔
   endpoint_override TEXT NOT NULL DEFAULT '',    -- 手动指定对外地址 host[:port]
   listen_port       INTEGER NOT NULL DEFAULT 51820,

@@ -180,3 +180,92 @@ test('迁移文件可以在旧库上执行', async () => {
   const cols = env.db.prepare('PRAGMA table_info(nodes)').all().map((c) => c.name);
   for (const c of ['stun_endpoint', 'stun_at', 'nat_type', 'paths']) assert.ok(cols.includes(c), c);
 });
+
+// ───────────── 客户端设备（手机/电脑，官方 WireGuard App）─────────────
+
+const addClient = (env, cookie, net, name, c) =>
+  call(env, 'POST', `/api/admin/networks/${net}/clients`, { cookie, body: { name, public_key: pubKey(c) } });
+
+test('客户端: 没有可用 Hub 时拒绝创建；输入校验', async () => {
+  const env = makeEnv();
+  const login = await call(env, 'POST', '/api/admin/login', { body: { password: 'pw' } });
+  const cookie = login.headers.get('set-cookie').split(';')[0];
+  const net = (await call(env, 'POST', '/api/admin/networks', { cookie, body: { name: 'lab', cidr: '10.88.0.0/24' } })).json.id;
+  assert.equal((await addClient(env, cookie, net, 'phone', 'P')).status, 409);
+  const bad = await call(env, 'POST', `/api/admin/networks/${net}/clients`, { cookie, body: { name: 'phone', public_key: 'nope' } });
+  assert.equal(bad.status, 400);
+});
+
+test('客户端: 只有主 Hub 把它当对端；其他节点把它挂在主 Hub 的 AllowedIPs 上', async () => {
+  const { env, cookie, net, nodes } = await setup();
+  await sync(env, nodes.hub1, '198.51.100.1');
+  // 第二个 Hub
+  const h2 = (await call(env, 'POST', `/api/admin/networks/${net}/nodes`, { cookie, body: { name: 'hub2', is_hub: true } })).json.id;
+  const tok = (await call(env, 'GET', `/api/admin/networks/${net}/nodes`, { cookie })).json.nodes.find((n) => n.id === h2).enroll_token;
+  const reg = await call(env, 'POST', '/api/agent/register', { form: { token: tok, public_key: pubKey('Z') } });
+  const hub2 = { id: h2, secret: /NODE_SECRET=(\w+)/.exec(reg.text)[1] };
+
+  const r = await addClient(env, cookie, net, 'phone', 'P');
+  assert.equal(r.status, 201, r.text);
+  assert.equal(r.json.hub_name, 'hub1');
+  assert.equal(r.json.hub_public_key, pubKey('H'));
+  assert.equal(r.json.endpoint, '198.51.100.1:51820');
+  assert.equal(r.json.allowed_ips, '10.88.0.0/24, 192.168.7.0/24');
+  const cip = r.json.ip;
+
+  // 主 Hub: 客户端是普通对端，没有 Endpoint
+  const c1 = (await sync(env, nodes.hub1, '198.51.100.1')).text;
+  const blk = c1.split('\n\n').find((b) => b.includes('(client)'));
+  assert.match(blk, new RegExp(`PublicKey = ${pubKey('P')}`));
+  assert.match(blk, new RegExp(`AllowedIPs = ${cip.replace(/\./g, '\\.')}/32`));
+  assert.doesNotMatch(blk, /Endpoint/);
+
+  // 普通节点: 没有客户端对端块，但主 Hub 的 AllowedIPs 里有它
+  const c2 = (await sync(env, nodes.alice, '203.0.113.60')).text;
+  assert.ok(!c2.includes('(client)'));
+  assert.match(peerBlock(c2, 'hub1'), new RegExp(`AllowedIPs = 10\\.88\\.0\\.1/32, ${cip.replace(/\./g, '\\.')}/32`));
+
+  // 第二个 Hub: 同样经主 Hub 访问客户端
+  const c3 = (await sync(env, hub2, '198.51.100.2')).text;
+  assert.ok(!c3.includes('(client)'));
+  assert.match(peerBlock(c3, 'hub1'), new RegExp(`${cip.replace(/\./g, '\\.')}/32`));
+
+  // 禁用后从所有配置里消失
+  await call(env, 'PUT', `/api/admin/nodes/${r.json.id}`, { cookie, body: { enabled: false } });
+  assert.ok(!(await sync(env, nodes.hub1, '198.51.100.1')).text.includes('(client)'));
+  assert.doesNotMatch(peerBlock((await sync(env, nodes.alice, '203.0.113.60')).text, 'hub1'), new RegExp(`${cip.replace(/\./g, '\\.')}/32`));
+});
+
+test('客户端: 中心辐射模式下辐射节点已经通过 netCidr 覆盖客户端', async () => {
+  const { env, cookie, net, nodes } = await setup('hub');
+  await sync(env, nodes.hub1, '198.51.100.1');
+  const r = await addClient(env, cookie, net, 'laptop', 'L');
+  assert.equal(r.status, 201, r.text);
+  const c = (await sync(env, nodes.alice, '203.0.113.60')).text;
+  assert.match(peerBlock(c, 'hub1'), /AllowedIPs = [^\n]*10\.88\.0\.0\/24/);
+  assert.ok((await sync(env, nodes.hub1, '198.51.100.1')).text.includes('(client)'));
+});
+
+test('客户端: 旧库没有 is_client 列时自动补列；换钥匙后公钥更新', async () => {
+  const schema = readFileSync(new URL('../schema.sql', import.meta.url), 'utf8').split('\n').filter((l) => !l.includes('is_client')).join('\n');
+  const env = makeEnv(schema);
+  const login = await call(env, 'POST', '/api/admin/login', { body: { password: 'pw' } });
+  const cookie = login.headers.get('set-cookie').split(';')[0];
+  const net = (await call(env, 'POST', '/api/admin/networks', { cookie, body: { name: 'lab', cidr: '10.88.0.0/24' } })).json.id;
+  const id = (await call(env, 'POST', `/api/admin/networks/${net}/nodes`, { cookie, body: { name: 'hub1', is_hub: true, endpoint_override: 'hub.example.com' } })).json.id;
+  const tok = (await call(env, 'GET', `/api/admin/networks/${net}/nodes`, { cookie })).json.nodes.find((n) => n.id === id).enroll_token;
+  await call(env, 'POST', '/api/agent/register', { form: { token: tok, public_key: pubKey('H') } });
+
+  const r = await addClient(env, cookie, net, 'phone', 'P');
+  assert.equal(r.status, 201, r.text);
+  assert.equal(r.json.endpoint, 'hub.example.com:51820');
+  const k = await call(env, 'PUT', `/api/admin/nodes/${r.json.id}/client`, { cookie, body: { public_key: pubKey('Q') } });
+  assert.equal(k.status, 200, k.text);
+  const list = (await call(env, 'GET', `/api/admin/networks/${net}/nodes`, { cookie })).json.nodes;
+  const phone = list.find((n) => n.name === 'phone');
+  assert.equal(phone.public_key, pubKey('Q'));
+  assert.equal(phone.is_client, true);
+  assert.equal(phone.enroll_token, null);
+  // 普通节点不能被当成客户端换钥匙
+  assert.equal((await call(env, 'PUT', `/api/admin/nodes/${id}/client`, { cookie, body: { public_key: pubKey('Q') } })).status, 404);
+});

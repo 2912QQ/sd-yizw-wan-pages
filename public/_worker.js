@@ -194,6 +194,12 @@ function parseNodeFields(b) {
   return o;
 }
 
+const validPubKey = (v) => {
+  const k = String(v || '').trim();
+  if (!/^[A-Za-z0-9+/]{43}=$/.test(k)) throw new HttpError(400, '公钥格式无效');
+  return k;
+};
+
 const isUnique = (e) => /UNIQUE constraint failed/i.test(String(e && e.message));
 
 async function readJson(request) {
@@ -241,6 +247,62 @@ async function createNode(env, netId, body) {
   throw new HttpError(409, '分配地址失败，请重试');
 }
 
+// ───────────────────────── 客户端设备（手机/电脑，用官方 WireGuard App，不跑 agent）─────────────────────────
+// 客户端只和“主 Hub”（本网络里 id 最小的、启用且已注册的 Hub）建立连接；
+// 其余节点通过主 Hub 的 AllowedIPs 访问客户端。私钥只在管理员浏览器里生成，服务端只存公钥。
+
+async function clientInfo(env, net) {
+  const { results } = await env.DB.prepare(
+    'SELECT * FROM nodes WHERE network_id=? AND enabled=1 AND public_key IS NOT NULL ORDER BY id'
+  ).bind(net.id).all();
+  const hub = results.find((n) => n.is_hub && !n.is_client);
+  if (!hub) throw new HttpError(409, '本网络还没有可用的 Hub：请先把一个有公网 IP 的节点设为 Hub 并让它上线，手机/电脑才能接入');
+  const endpoint = endpointFor(hub, now());
+  if (!endpoint) throw new HttpError(409, `Hub“${hub.name}”还没有可用的对外地址：请等它上线，或在编辑节点里手动指定“对外地址”`);
+  const c = parseCidr(net.cidr);
+  const allowed = [`${intToIp(c.net)}/${c.bits}`];
+  for (const n of results) if (n.subnets) allowed.push(...n.subnets.split(','));
+  return { hub_name: hub.name, hub_public_key: hub.public_key, endpoint, allowed_ips: [...new Set(allowed)].join(', ') };
+}
+
+async function insertClient(env, net, name, ip, pub) {
+  const run = () => env.DB.prepare('INSERT INTO nodes (network_id,name,ip,public_key,is_client,created_at) VALUES (?,?,?,?,1,?)')
+    .bind(net.id, name, ip, pub, now()).run();
+  try {
+    return await run();
+  } catch (e) {
+    // 旧库还没有 is_client 列：自动补上再重试（等价于执行 migrations/0002_clients.sql）
+    if (/no column named is_client|no such column:? ?is_client/i.test(String(e && e.message))) {
+      await env.DB.prepare('ALTER TABLE nodes ADD COLUMN is_client INTEGER NOT NULL DEFAULT 0').run().catch(() => {});
+      return await run();
+    }
+    throw e;
+  }
+}
+
+async function createClient(env, netId, body) {
+  const net = await env.DB.prepare('SELECT * FROM networks WHERE id=?').bind(netId).first();
+  if (!net) throw new HttpError(404, '网络不存在');
+  const name = validName(body.name);
+  const pub = validPubKey(body.public_key);
+  const info = await clientInfo(env, net);
+  for (let i = 0; i < 5; i++) {
+    const ip = await allocateIp(env, net);
+    if (!ip) throw new HttpError(409, '地址池已用尽');
+    try {
+      const r = await insertClient(env, net, name, ip, pub);
+      return { id: r.meta.last_row_id, ip, ...info };
+    } catch (e) {
+      if (isUnique(e)) {
+        if (/nodes\.name/.test(String(e.message))) throw new HttpError(409, '该网络下已有同名节点');
+        continue; // IP 冲突，重新分配
+      }
+      throw e;
+    }
+  }
+  throw new HttpError(409, '分配地址失败，请重试');
+}
+
 const isOnline = (n, t) => !!(n.enabled && n.last_seen && t - n.last_seen < ONLINE_WINDOW);
 
 function publicNode(n, t) {
@@ -250,6 +312,7 @@ function publicNode(n, t) {
     name: n.name,
     ip: n.ip,
     is_hub: !!n.is_hub,
+    is_client: !!n.is_client,
     subnets: n.subnets || '',
     endpoint_override: n.endpoint_override || '',
     listen_port: n.listen_port,
@@ -283,7 +346,8 @@ function endpointFor(p, t) {
 //   self: mode=mesh|hub  hub=0|1  override=0|1
 //   peer: id  hub  online  nat
 // mesh 模式下 agent 会先尝试直连，打不通时把该对端经由 Hub 中转。
-function buildConfig(self, net, peers, t) {
+function buildConfig(self, net, allPeers, t) {
+  let peers = allPeers;
   const c = parseCidr(net.cidr);
   const netCidr = `${intToIp(c.net)}/${c.bits}`;
   const L = [
@@ -302,14 +366,20 @@ function buildConfig(self, net, peers, t) {
     );
   }
 
+  const clients = peers.filter((p) => p.is_client);
+  peers = peers.filter((p) => !p.is_client);
   const hubs = peers.filter((p) => p.is_hub);
   const spoke = net.mode === 'hub' && !self.is_hub;
   const list = spoke ? hubs : peers;
   const primaryHub = hubs[0];
+  // 客户端（手机/电脑）只连主 Hub：主 Hub 把它们当对端；其余节点把它们的地址挂在主 Hub 上
+  const iAmPrimary = !!self.is_hub && hubs.every((h) => h.id > self.id);
+  const clientIps = clients.map((c) => `${c.ip}/32`);
 
   for (const p of list) {
     const allowed = [`${p.ip}/32`];
     if (p.subnets) allowed.push(...p.subnets.split(','));
+    if (p === primaryHub && !iAmPrimary) allowed.push(...clientIps);
     if (spoke && p === primaryHub) {
       // 中心辐射模式: 其余节点（及其内网网段）的流量经主 Hub 中转
       allowed.push(netCidr);
@@ -323,6 +393,11 @@ function buildConfig(self, net, peers, t) {
     const ep = endpointFor(p, t);
     if (ep) L.push(`Endpoint = ${ep}`);
     L.push('PersistentKeepalive = 25');
+  }
+  if (iAmPrimary) {
+    for (const c of clients) {
+      L.push('', '[Peer]', `# ${c.name} (client)`, `PublicKey = ${c.public_key}`, `AllowedIPs = ${c.ip}/32`);
+    }
   }
   return L.join('\n') + '\n';
 }
@@ -506,6 +581,20 @@ async function handleAdmin(request, env, url) {
     }
   }
 
+  if ((m = path.match(/^\/networks\/(\d+)\/clients$/)) && method === 'POST') {
+    return jsonResp(await createClient(env, Number(m[1]), await readJson(request)), 201);
+  }
+
+  if ((m = path.match(/^\/nodes\/(\d+)\/client$/)) && method === 'PUT') {
+    const n = await env.DB.prepare('SELECT * FROM nodes WHERE id=?').bind(Number(m[1])).first();
+    if (!n || !n.is_client) throw new HttpError(404, '客户端设备不存在');
+    const net = await env.DB.prepare('SELECT * FROM networks WHERE id=?').bind(n.network_id).first();
+    const pub = validPubKey((await readJson(request)).public_key);
+    const info = await clientInfo(env, net);
+    await env.DB.prepare('UPDATE nodes SET public_key=? WHERE id=?').bind(pub, n.id).run();
+    return jsonResp({ id: n.id, ip: n.ip, ...info });
+  }
+
   if ((m = path.match(/^\/nodes\/(\d+)$/))) {
     const id = Number(m[1]);
     if (method === 'PUT') {
@@ -567,7 +656,7 @@ export default {
       } else if (/no such table/i.test(msg)) {
         hint = '数据库未初始化（线上库没有表）：请对 --remote 执行 schema.sql，并确认绑定的是同一个 D1 数据库';
       } else if (/no such column/i.test(msg)) {
-        hint = '数据库结构过旧，请执行 migrations/0001_stun_paths.sql';
+        hint = '数据库结构过旧，请执行 migrations/ 目录里的 SQL（0001、0002）';
       }
       return jsonResp({ error: hint }, 500);
     }
