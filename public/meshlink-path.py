@@ -55,9 +55,11 @@ REPORT_HEARTBEAT = 900  # 秒；状态没变化时的心跳上报间隔（控制
 REPORT_MIN_GAP = 5
 REPORT_RETRY = 30
 LAT_INTERVAL = 30      # 秒；同一个对端两次测延迟的最小间隔
-LAT_BUDGET = 3.0       # 秒；每个 TICK 里测延迟最多占用的时间，避免拖慢路径检测
+LAT_BUDGET = 4.0       # 秒；每个 TICK 里测延迟最多占用的时间，避免拖慢路径检测
 LAT_TTL = 120          # 秒；超过这么久没测到就不再显示旧延迟
-LAT_COUNT = 2          # 每次测量发几个包，取最小值
+LAT_COUNT = 5          # 每次测量发几个包：延迟取最小值，丢包率 = 没收到回包的比例
+LAT_GAP = 0.2          # 秒；两个探测包的间隔（太密会被运营商当成突发而误丢）
+LOSS_WINDOW = 120      # 秒；丢包率按最近这么久内所有探测包统计，避免 5 个包的样本太抖
 
 
 def out(s=''):
@@ -219,39 +221,65 @@ def icmp_is_reply(data, ident, seq):
     return typ == 0 and code == 0 and rid == ident and rseq == seq
 
 
+LOSS_RE = re.compile(r'([0-9]+(?:\.[0-9]+)?)%\s*packet loss')
+
+
 def parse_ping(text):
     """解析系统 ping 的输出，返回最小的往返延迟（毫秒）或 None。"""
     vals = [float(x) for x in PING_RE.findall(text or '')]
     return min(vals) if vals else None
 
 
+def parse_loss(text, count):
+    """解析系统 ping 的丢包百分比，返回 (发送数, 丢失数)；解析不到时按收到的回包数估算。"""
+    m = LOSS_RE.search(text or '')
+    if m:
+        return count, int(round(float(m.group(1)) * count / 100.0))
+    got = len(PING_RE.findall(text or ''))
+    return count, max(0, count - got)
+
+
 def ping_cmd_rtt(ip, count=LAT_COUNT, wait=1):
-    """没有 raw socket 权限时退回系统 ping（busybox / iputils 都支持 -c / -W）。"""
+    """没有 raw socket 权限时退回系统 ping（busybox / iputils 都支持 -c / -W）。
+    返回 (最小延迟 ms 或 None, 发送数, 丢失数)；ping 命令本身起不来时返回 None（不计入丢包）。"""
     try:
         r = subprocess.run(['ping', '-c', str(count), '-W', str(wait), ip], stdout=subprocess.PIPE,
-                           stderr=subprocess.DEVNULL, universal_newlines=True, timeout=count * wait + 3)
+                           stderr=subprocess.DEVNULL, universal_newlines=True, timeout=count * (wait + 1) + 3)
     except (OSError, subprocess.TimeoutExpired):
         return None
-    return parse_ping(r.stdout)
+    sent, lost = parse_loss(r.stdout, count)
+    return parse_ping(r.stdout), sent, lost
 
 
-def ping_rtt(ip, count=LAT_COUNT, timeout=1.0):
-    """向 ip 发 ICMP Echo，返回最小往返延迟（毫秒，float）；不通返回 None。
+def icmp_reply_seq(data, ident):
+    """raw socket 收到的包若是本进程的 Echo Reply，返回它的序号，否则 None。"""
+    if len(data) < 20:
+        return None
+    ihl = (data[0] & 0x0F) * 4
+    if len(data) < ihl + 8:
+        return None
+    typ, code, _chk, rid, rseq = struct.unpack('>BBHHH', data[ihl:ihl + 8])
+    return rseq if (typ == 0 and code == 0 and rid == ident) else None
+
+
+def ping_rtt(ip, count=LAT_COUNT, timeout=1.0, gap=LAT_GAP):
+    """向 ip 发 count 个 ICMP Echo（间隔 gap 秒），返回 (最小往返延迟 ms 或 None, 发送数, 丢失数)。
     优先用 raw socket（不依赖 ping 命令，root 运行的 agent 都可用），失败再退回系统 ping。"""
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
     except OSError:
         return ping_cmd_rtt(ip, count)
     ident = os.getpid() & 0xFFFF
-    best = None
+    sent_at, rtts = {}, {}
     try:
         for seq in range(count):
             try:
                 sock.sendto(icmp_echo(ident, seq), (ip, 0))
             except OSError:
                 break
-            t0 = time.perf_counter()
-            end = t0 + timeout
+            sent_at[seq] = time.perf_counter()
+            # 发完下一个包之前一直收包；最后一个包多等 timeout 秒
+            end = time.perf_counter() + (gap if seq < count - 1 else timeout)
             while True:
                 left = end - time.perf_counter()
                 if left <= 0:
@@ -261,13 +289,16 @@ def ping_rtt(ip, count=LAT_COUNT, timeout=1.0):
                     data, frm = sock.recvfrom(2048)
                 except OSError:                       # 含 socket.timeout
                     break
-                if frm[0] == ip and icmp_is_reply(data, ident, seq):
-                    rtt = (time.perf_counter() - t0) * 1000.0
-                    best = rtt if best is None else min(best, rtt)
-                    break
+                rseq = icmp_reply_seq(data, ident)
+                if frm[0] == ip and rseq in sent_at and rseq not in rtts:
+                    rtts[rseq] = (time.perf_counter() - sent_at[rseq]) * 1000.0
+                    if seq == count - 1 and len(rtts) == len(sent_at):
+                        break                         # 全部收齐，不用等满超时
     finally:
         sock.close()
-    return best
+    if not sent_at:
+        return None, 0, 0
+    return (min(rtts.values()) if rtts else None), len(sent_at), len(sent_at) - len(rtts)
 
 
 def peer_ip(peer):
@@ -280,6 +311,10 @@ def peer_ip(peer):
 
 def fmt_rtt(ms):
     return '-' if ms is None else ('%d ms' % ms)
+
+
+def fmt_loss(pct):
+    return '-' if pct is None else ('%d%%' % pct)
 
 
 # ───────────────────────── 配置 / wg 输出解析 ─────────────────────────
@@ -651,6 +686,8 @@ class Daemon:
         self.rtt = {}           # pub -> (毫秒, 测量时间)；用于状态文件 / 命令行显示
         self.rtt_rep = {}       # pub -> 上报用的延迟（带迟滞，避免每次抖动都触发上报）
         self.rtt_try = {}       # pub -> 上次尝试测量的时间
+        self.loss_hist = {}     # pub -> [(测量时间, 发送数, 丢失数)]；丢包率按最近 LOSS_WINDOW 秒统计
+        self.loss_rep = {}      # pub -> 上报用的丢包率（带迟滞）
         self.now = clock
         self.pm = PathManager()
         self.endpoint, self.nat = None, 'unknown'
@@ -687,7 +724,7 @@ class Daemon:
             rows.append({'id': p['meta'].get('id'), 'name': p['name'], 'pub': p['pub'],
                          'hub': p['meta'].get('hub') == '1', 'state': labels.get(p['pub'], ''),
                          'hs_age': int(t - d['hs']) if d.get('hs') else None, 'nat': p['meta'].get('nat', 'unknown'),
-                         'rtt': self.rtt_ms(p['pub']),
+                         'rtt': self.rtt_ms(p['pub']), 'loss': self.loss_pct(p['pub']),
                          'family': self.family_of(p['pub'], d)})
         data = {'ts': int(t), 'nat': self.nat, 'endpoint': self.endpoint, 'peers': rows, 'modes': self.pm.modes()}
         try:
@@ -749,13 +786,13 @@ class Daemon:
         due = []
         for pub in list(self.rtt_try):
             if labels.get(pub) not in ('d', 'r') or not ips.get(pub):
-                for m in (self.rtt, self.rtt_rep, self.rtt_try):
+                for m in (self.rtt, self.rtt_rep, self.rtt_try, self.loss_hist, self.loss_rep):
                     m.pop(pub, None)
         for pub, state in labels.items():
             if state not in ('d', 'r') or not ips.get(pub):
                 continue
-            if self.last_labels.get(pub) != state:       # 直连 <-> 中转 切换，旧延迟作废
-                for m in (self.rtt, self.rtt_rep, self.rtt_try):
+            if self.last_labels.get(pub) != state:       # 直连 <-> 中转 切换，旧延迟 / 丢包作废
+                for m in (self.rtt, self.rtt_rep, self.rtt_try, self.loss_hist, self.loss_rep):
                     m.pop(pub, None)
             if t - self.rtt_try.get(pub, -1e9) >= LAT_INTERVAL:
                 due.append(pub)
@@ -766,9 +803,13 @@ class Daemon:
                 break
             self.rtt_try[pub] = t
             try:
-                ms = self.ping_fn(ips[pub])
+                res = self.ping_fn(ips[pub])
             except Exception:
-                ms = None
+                res = None
+            # ping_fn 返回 (延迟, 发送数, 丢失数)；也兼容只返回延迟（或 None）
+            ms, sent, lost = res if isinstance(res, tuple) else (res, 0, 0)
+            if sent:
+                self.record_loss(pub, t, sent, lost)
             if ms is None:
                 continue
             self.rtt[pub] = (ms, t)
@@ -778,6 +819,27 @@ class Daemon:
         for pub in [k for k, v in self.rtt.items() if t - v[1] > LAT_TTL]:
             for m in (self.rtt, self.rtt_rep):
                 m.pop(pub, None)
+        for pub in list(self.loss_hist):
+            self.loss_hist[pub] = [h for h in self.loss_hist[pub] if t - h[0] <= LOSS_WINDOW]
+            if not self.loss_hist[pub]:
+                self.loss_hist.pop(pub, None)
+                self.loss_rep.pop(pub, None)
+
+    def record_loss(self, pub, t, sent, lost):
+        self.loss_hist.setdefault(pub, []).append((t, sent, lost))
+        self.loss_hist[pub] = [h for h in self.loss_hist[pub] if t - h[0] <= LOSS_WINDOW]
+        pct = self.loss_pct(pub)
+        old = self.loss_rep.get(pub)
+        # 迟滞: 变化 >= 5 个百分点，或在 0 与非 0 之间切换，才更新上报值
+        if old is None or abs(pct - old) >= 5 or (pct == 0) != (old == 0):
+            self.loss_rep[pub] = pct
+
+    def loss_pct(self, pub):
+        h = self.loss_hist.get(pub)
+        if not h:
+            return None
+        sent = sum(x[1] for x in h)
+        return 0 if not sent else int(round(100.0 * sum(x[2] for x in h) / sent))
 
     def rtt_ms(self, pub):
         v = self.rtt.get(pub)
@@ -870,11 +932,14 @@ class Daemon:
             pub, label = p['pub'], plabels[p['pub']]
             ms = self.rtt_rep.get(pub)
             fam = {'v6': '6', 'v4': '4'}.get(self.family_of(pub, dump.get(pub))) if label == 'd' else None
+            loss = self.loss_rep.get(pub)
             item = '%s:%s' % (p['meta']['id'], label)
-            if ms is not None or fam:
+            if ms is not None or fam or loss is not None:
                 item += ':%s' % ('' if ms is None else ms)
-            if fam:
-                item += ':' + fam
+            if fam or loss is not None:
+                item += ':' + (fam or '')
+            if loss is not None:
+                item += ':%d' % loss          # 格式 id:状态:延迟:6|4:丢包% ；缺的字段留空
             return item
         self.paths_str = ','.join(path_item(p) for p in peers
                                   if p['pub'] in plabels and p['meta'].get('id', '').isdigit()
@@ -924,13 +989,13 @@ def cmd_status():
     out('状态更新于 %d 秒前' % max(0, int(time.time()) - st.get('ts', 0)))
     rows = st.get('peers', [])
     if rows:
-        out('对端路径:')
+        out('对端路径（状态 / 协议 / 延迟 / 近 2 分钟丢包率 / 握手）:')
         for p in rows:
             hs = ('握手 %ds 前' % p['hs_age']) if p.get('hs_age') is not None else '尚未握手'
             fam = {'v6': 'IPv6', 'v4': 'IPv4'}.get(p.get('family'), '-')
-            out('  %-20s %-12s %-5s %-8s %s' % ((p.get('name') or p['pub'][:8]) + (' [Hub]' if p.get('hub') else ''),
-                                                 STATE_TEXT.get(p.get('state'), '-'), fam,
-                                                 fmt_rtt(p.get('rtt')), hs))
+            out('  %-20s %-12s %-5s %-8s %-6s %s' % ((p.get('name') or p['pub'][:8]) + (' [Hub]' if p.get('hub') else ''),
+                                                     STATE_TEXT.get(p.get('state'), '-'), fam,
+                                                     fmt_rtt(p.get('rtt')), fmt_loss(p.get('loss')), hs))
     return 0
 
 

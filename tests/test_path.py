@@ -608,6 +608,18 @@ class PingHelperTests(unittest.TestCase):
         self.assertIsNone(mp.parse_ping('100% packet loss'))
         self.assertIsNone(mp.parse_ping(None))
 
+    def test_parse_loss_output(self):
+        gnu = '5 packets transmitted, 4 received, 20% packet loss, time 804ms\n'
+        self.assertEqual(mp.parse_loss(gnu, 5), (5, 1))
+        self.assertEqual(mp.parse_loss('5 packets transmitted, 0 packets received, 100% packet loss', 5), (5, 5))
+        self.assertEqual(mp.parse_loss('64 bytes from x: seq=0 ttl=64 time=1 ms\n', 5), (5, 4))   # 没有统计行: 按回包数估算
+
+    def test_icmp_reply_seq(self):
+        reply = bytes([0x45, 0, 0, 0, 0, 0, 0, 0, 64, 1, 0, 0, 10, 0, 0, 1, 10, 0, 0, 2]) + struct.pack('>BBHHH', 0, 0, 0, 0x1234, 3)
+        self.assertEqual(mp.icmp_reply_seq(reply, 0x1234), 3)
+        self.assertIsNone(mp.icmp_reply_seq(reply, 0x9999))
+        self.assertIsNone(mp.icmp_reply_seq(b'short', 1))
+
     def test_peer_ip(self):
         self.assertEqual(mp.peer_ip(peers()[1]), '10.88.0.3')
         self.assertIsNone(mp.peer_ip({'allowed': ['192.168.7.0/24']}))
@@ -691,6 +703,33 @@ class LatencyDaemonTests(unittest.TestCase):
         self.values[0] = 60.0                                 # 明显变化才更新
         self.tick(mp.LAT_INTERVAL)
         self.assertEqual(self.item('3'), '3:d:60')
+
+    def test_loss_is_reported_with_hysteresis(self):
+        self.values[0] = (20.0, 5, 0)
+        self.tick()
+        self.assertEqual(self.item('3'), '3:d:20::0')                # 延迟 20，没标记协议，丢包 0
+        self.values[0] = (20.0, 5, 1)                                # 5 个包丢 1 个；窗口内累计 1/10 = 10%
+        self.tick(mp.LAT_INTERVAL)
+        self.assertEqual(self.item('3'), '3:d:20::10')
+        self.assertEqual(json.load(open(os.path.join(self.tmp, 'status.json')))['peers'][1]['loss'], 10)
+        self.values[0] = (20.0, 5, 0)                                # 2/15 -> 13%，变化不到 5 个点: 上报值保持 10
+        self.tick(mp.LAT_INTERVAL)
+        self.assertEqual(self.item('3'), '3:d:20::10')
+
+    def test_total_loss_still_reported(self):
+        self.wg.state[A]['endpoint'] = '203.0.113.7:41000'
+        self.values[0] = (None, 5, 5)
+        self.tick()
+        self.assertEqual(self.item('3'), '3:d::4:100')
+        self.assertIsNone(self.d.rtt_ms(A))
+
+    def test_loss_window_expires(self):
+        self.values[0] = (20.0, 5, 5)
+        self.tick()
+        self.values[0] = None
+        for _ in range(0, mp.LOSS_WINDOW + mp.LAT_INTERVAL + 1, mp.LAT_INTERVAL):
+            self.tick(mp.LAT_INTERVAL)
+        self.assertIsNone(self.d.loss_pct(A))
 
     def test_failed_ping_keeps_state_without_latency(self):
         self.values[0] = None

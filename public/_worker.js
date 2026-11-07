@@ -180,11 +180,15 @@ function normStun(v) {
   return `${m[1]}:${port}`;
 }
 
-// 路径状态 "id:d,id:p,id:r"；d=直连 p=尝试中 r=中转；可附带往返延迟（毫秒）和 IPv6/IPv4: "id:d:23"、"id:d:23:6"、"id:d::4"
+// 路径状态 "id:d,id:p,id:r"；d=直连 p=尝试中 r=中转；可附带往返延迟（毫秒）、IPv6/IPv4 和丢包率（%）: "id:d:23"、"id:d:23:6"、"id:d::4"、"id:d:23:4:12"、"id:r:40::0"
 function normPaths(v) {
   const out = [];
   for (const item of String(v ?? '').split(',').filter(Boolean).slice(0, 200)) {
-    if (!/^\d{1,10}:[dpr](?::\d{1,5}(?::[46])?|::[46])?$/.test(item)) throw new HttpError(400, 'paths 格式无效');
+    const f = item.split(':');   // id:状态[:延迟[:6|4[:丢包%]]]，中间的字段可以留空，但不能以冒号结尾
+    const ok = f.length <= 5 && /^\d{1,10}$/.test(f[0]) && /^[dpr]$/.test(f[1] ?? '') && f[f.length - 1] !== ''
+      && (f[2] === undefined || /^\d{0,5}$/.test(f[2])) && (f[3] === undefined || /^[46]?$/.test(f[3]))
+      && (f[4] === undefined || /^\d{1,3}$/.test(f[4]));
+    if (!ok) throw new HttpError(400, 'paths 格式无效');
     out.push(item);
   }
   return out.join(',');
@@ -192,10 +196,11 @@ function normPaths(v) {
 
 function parsePaths(v) {
   return String(v || '').split(',').filter(Boolean).map((x) => {
-    const [id, state, rtt, fam] = x.split(':');
+    const [id, state, rtt, fam, loss] = x.split(':');
     const o = { peer_id: Number(id), state };
     if (rtt) o.rtt = Number(rtt);
     if (fam === '6') o.family = 'v6'; else if (fam === '4') o.family = 'v4';
+    if (loss !== undefined && loss !== '') o.loss = Math.min(100, Number(loss));
     return o;
   });
 }
@@ -560,6 +565,16 @@ function endpointFor(p, t) {
 // IPv6 优先: 请求方带 X-Meshlink-Path（agent 装了路径管理器）且双方都有公网 IPv6 时，Endpoint 先给 IPv6，
 // 同时在 peer 元信息里附上 ep6/ep4，路径管理器在 IPv6 握手不成功时改试 IPv4，两个都不通才走 Hub 中转。
 // 没有路径管理器的 agent 保持原来的 IPv4 优先，不会因为 IPv6 被拦而断连。
+// WireGuard 默认 MTU 1420 是按“外层 1500 字节、IPv4”算的。外层是 PPPoE（1492）、蜂窝/CGNAT（常见 1400~1450）
+// 或 IPv6（封装多 20 字节）时，大包会被外层丢掉或分片后丢失；ping 这种小包完全正常，所以表现为“延迟很低但丢包严重、
+// 传文件 / 看视频卡”。统一把隧道 MTU 压到 1380，留出足够余量；对端 MTU 不需要一致，不会有兼容问题。
+const WG_MTU = 1380;
+// 本机转发 TCP（Hub 中转 / 子网路由）时把 SYN 的 MSS 钳到出口 MTU，避免两端按 1460 协商后大包被丢。
+const MSS_UP = 'iptables -t mangle -I FORWARD -o %i -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu || true; iptables -t mangle -I FORWARD -i %i -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu || true';
+const MSS_DOWN = 'iptables -t mangle -D FORWARD -o %i -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu || true; iptables -t mangle -D FORWARD -i %i -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu || true';
+// 运营商 / CGNAT 对 UDP 映射的空闲超时常常只有 15~30 秒，25 秒的保活会时不时错过，映射被回收后包就丢了，直到下一次握手才恢复。
+const PEER_KEEPALIVE = 15;
+
 function buildConfig(self, net, allPeers, t, opts = {}) {
   let peers = allPeers;
   const c = parseCidr(net.cidr);
@@ -571,12 +586,13 @@ function buildConfig(self, net, allPeers, t, opts = {}) {
     '[Interface]',
     `Address = ${self.ip}/${c.bits}`,
     `ListenPort = ${self.listen_port}`,
+    `MTU = ${WG_MTU}`,
     'PrivateKey = __PRIVATE_KEY__',
   ];
   if (self.is_hub || self.subnets) {
     L.push(
-      'PostUp = sysctl -w net.ipv4.ip_forward=1 >/dev/null || true; iptables -I FORWARD -i %i -j ACCEPT || true; iptables -I FORWARD -o %i -j ACCEPT || true',
-      'PostDown = iptables -D FORWARD -i %i -j ACCEPT || true; iptables -D FORWARD -o %i -j ACCEPT || true'
+      'PostUp = sysctl -w net.ipv4.ip_forward=1 >/dev/null || true; iptables -I FORWARD -i %i -j ACCEPT || true; iptables -I FORWARD -o %i -j ACCEPT || true; ' + MSS_UP,
+      'PostDown = iptables -D FORWARD -i %i -j ACCEPT || true; iptables -D FORWARD -o %i -j ACCEPT || true; ' + MSS_DOWN
     );
   }
 
@@ -615,7 +631,7 @@ function buildConfig(self, net, allPeers, t, opts = {}) {
       `PublicKey = ${p.public_key}`, `AllowedIPs = ${[...new Set(allowed)].join(', ')}`
     );
     if (ep) L.push(`Endpoint = ${ep}`);
-    L.push('PersistentKeepalive = 25');
+    L.push(`PersistentKeepalive = ${PEER_KEEPALIVE}`);
   }
   if (iAmPrimary) {
     for (const c of clients) {

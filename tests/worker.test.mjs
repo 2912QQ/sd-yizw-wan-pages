@@ -137,7 +137,7 @@ test('report: paths 可附带往返延迟，旧格式仍然兼容', async () => 
   assert.equal((await rep(`${nodes.bob.id}:d:23:6,${nodes.hub1.id}:d::4`)).status, 200);   // 带 IPv6/IPv4 标记
   const fam = (await call(env, 'GET', `/api/admin/networks/${net}/nodes`, { cookie })).json.nodes.find((n) => n.id === nodes.alice.id);
   assert.deepEqual(fam.paths, [{ peer_id: nodes.bob.id, state: 'd', rtt: 23, family: 'v6' }, { peer_id: nodes.hub1.id, state: 'd', family: 'v4' }]);
-  for (const bad of ['1:d:', '1:d:abc', '1:d:123456', '1:x:5', '1:d:5:7', '1:d:5:6:1', '1:d::']) assert.equal((await rep(bad)).status, 400, bad);
+  for (const bad of ['1:d:', '1:d:abc', '1:d:123456', '1:x:5', '1:d:5:7', '1:d::']) assert.equal((await rep(bad)).status, 400, bad);
 });
 
 test('在线: agent 没同步控制面，但在线节点报告与它有新鲜握手时显示在线（仅隧道）', async () => {
@@ -570,4 +570,26 @@ test('一键启用/停用: 只改本网络的设备；参数必须是布尔值�
   assert.equal(phone.name, 'my-phone');
   assert.equal(phone.ip, '10.88.0.77');
   assert.equal((await call(env, 'PUT', `/api/admin/nodes/${c.id}`, { cookie, body: { ip: '10.88.0.1' } })).status, 409);   // 与 hub1 等重复
+});
+
+test('report: paths 可附带丢包率，格式错误仍然拒绝', async () => {
+  const { env, cookie, net, nodes } = await setup();
+  const rep = (paths) => call(env, 'POST', '/api/agent/report', { bearer: nodes.alice.secret, form: { stun: '203.0.113.60:5555', nat: 'cone', paths } });
+  assert.equal((await rep(`${nodes.bob.id}:d:6:4:0,${nodes.hub1.id}:r:15::12`)).status, 200);
+  const a = (await call(env, 'GET', `/api/admin/networks/${net}/nodes`, { cookie })).json.nodes.find((n) => n.id === nodes.alice.id).paths;
+  assert.deepEqual(a, [
+    { peer_id: nodes.bob.id, state: 'd', rtt: 6, family: 'v4', loss: 0 },
+    { peer_id: nodes.hub1.id, state: 'r', rtt: 15, loss: 12 },
+  ]);
+  assert.equal((await rep(`${nodes.bob.id}:d::6:100`)).status, 200);      // 全丢: 没有延迟
+  for (const bad of ['1:d:5:4:1000', '1:d:5:4:x', '1:d:5:7:1', '1:d:5:4:', '1:d:1:4:1:1']) assert.equal((await rep(bad)).status, 400, bad);
+});
+
+test('config: 隧道 MTU 1380、保活 15 秒，Hub 带 MSS 钳制', async () => {
+  const { env, cookie, net, nodes } = await setup();
+  const r = await sync(env, nodes.hub1);
+  assert.equal(r.status, 200);
+  assert.match(r.text, /^MTU = 1380$/m);
+  assert.match(r.text, /^PersistentKeepalive = 15$/m);
+  assert.match(r.text, /TCPMSS --clamp-mss-to-pmtu/);
 });
