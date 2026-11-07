@@ -560,7 +560,16 @@ export default {
           : jsonResp({ error: e.message }, e.status);
       }
       console.error(e);
-      return jsonResp({ error: 'internal error' }, 500);
+      const msg = String((e && e.message) || e);
+      let hint = 'internal error';
+      if (!env.DB || /reading 'prepare'/.test(msg)) {
+        hint = '未检测到 D1 绑定 DB：请在 Pages 项目 Settings → Bindings 给 Production 和 Preview 都添加变量名为 DB 的 D1 绑定，然后重新部署';
+      } else if (/no such table/i.test(msg)) {
+        hint = '数据库未初始化（线上库没有表）：请对 --remote 执行 schema.sql，并确认绑定的是同一个 D1 数据库';
+      } else if (/no such column/i.test(msg)) {
+        hint = '数据库结构过旧，请执行 migrations/0001_stun_paths.sql';
+      }
+      return jsonResp({ error: hint }, 500);
     }
   },
 };
