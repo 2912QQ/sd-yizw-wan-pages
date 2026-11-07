@@ -270,10 +270,10 @@ function rttHtml(ms) {
   return `<span class="mono" style="color:${c}">${ms} ms</span>`;
 }
 
-// 丢包率（agent 近 2 分钟内的探测包统计）：0 绿，<5% 黄，>=5% 红；旧版 agent 不上报则不显示
+// 丢包率（agent 近 2 分钟内的探测包统计）：0 绿，<10% 黄，>=10% 红；旧版 agent 不上报则不显示
 function lossHtml(pct) {
   if (pct === undefined || pct === null) return '';
-  const c = pct === 0 ? 'var(--ok)' : pct < 5 ? 'var(--warn)' : 'var(--bad)';
+  const c = pct === 0 ? 'var(--ok)' : pct < 10 ? 'var(--warn)' : 'var(--bad)';
   const w = pct >= 20 ? 700 : 400;
   return `<span class="mono" style="color:${c};font-weight:${w}" title="最近 2 分钟 ICMP 探测的丢包率">丢包 ${pct}%</span>`;
 }
