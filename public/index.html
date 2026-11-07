@@ -1,0 +1,361 @@
+<!doctype html>
+<html lang="zh-Hans">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex">
+<title>MeshLink 控制台</title>
+<style>
+:root{--bg:#f4f6f9;--card:#fff;--text:#1b2230;--muted:#6a7587;--line:#e3e7ee;--pri:#2f6fed;--pri-t:#fff;--ok:#16a34a;--warn:#d97706;--bad:#dc2626;--code:#0f172a;--code-t:#e2e8f0}
+@media (prefers-color-scheme:dark){:root{--bg:#0e1218;--card:#161b24;--text:#e7eaf0;--muted:#8a94a6;--line:#262d3a;--pri:#5b8cff;--pri-t:#0b1220;--code:#0a0d12;--code-t:#cbd5e1}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif}
+[hidden]{display:none!important}
+.muted{color:var(--muted)}
+.center{min-height:100vh;display:grid;place-items:center;padding:16px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px}
+.login{width:100%;max-width:340px;padding:28px;display:grid;gap:12px}
+.login h1{margin:0;font-size:22px}
+input,select{width:100%;padding:9px 11px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--text);font:inherit}
+input:focus,select:focus{outline:2px solid var(--pri);outline-offset:-1px}
+input[type=checkbox]{width:auto}
+label{display:grid;gap:4px;font-size:13px;color:var(--muted)}
+label.inline{display:flex;gap:8px;align-items:center;color:var(--text)}
+.btn{border:1px solid var(--line);background:var(--card);color:var(--text);padding:8px 14px;border-radius:8px;font:inherit;cursor:pointer}
+.btn:hover{border-color:var(--pri)}
+.btn.pri{background:var(--pri);border-color:var(--pri);color:var(--pri-t)}
+.btn.ghost{background:transparent}
+.btn.sm{padding:4px 10px;font-size:12px}
+.btn.danger{color:var(--bad)}
+.err{color:var(--bad);margin:0;min-height:1em;font-size:13px}
+header{display:flex;justify-content:space-between;align-items:center;padding:12px 20px;background:var(--card);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:5}
+.brand{font-weight:700;font-size:16px}
+main{display:grid;grid-template-columns:260px 1fr;gap:16px;padding:16px 20px;max-width:1280px;margin:0 auto}
+aside{display:grid;gap:8px;align-content:start}
+.side-head{display:flex;justify-content:space-between;align-items:center;padding:0 2px}
+.net{padding:12px;cursor:pointer;display:grid;gap:2px}
+.net.active{border-color:var(--pri);box-shadow:0 0 0 1px var(--pri)}
+.net b{font-size:14px}
+.net small{color:var(--muted)}
+.net .cnt{float:right;font-size:12px;color:var(--muted)}
+#detail{display:grid;gap:12px;align-content:start;min-width:0}
+.panel{padding:16px}
+.head{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap}
+.head h2{margin:0;font-size:18px}
+.actions{display:flex;gap:6px;flex-wrap:wrap}
+.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
+.stat{padding:14px}
+.stat .n{font-size:24px;font-weight:700}
+.tbl-wrap{overflow-x:auto}
+table{width:100%;border-collapse:collapse;min-width:900px}
+th,td{text-align:left;padding:10px 8px;border-bottom:1px solid var(--line);white-space:nowrap}
+th{font-size:12px;color:var(--muted);font-weight:600}
+tr:last-child td{border-bottom:0}
+.badge{display:inline-flex;align-items:center;gap:5px;font-size:12px;padding:2px 8px;border-radius:99px;border:1px solid var(--line)}
+.badge i{width:7px;height:7px;border-radius:50%;background:var(--muted)}
+.b-ok i{background:var(--ok)}.b-ok{color:var(--ok)}
+.b-warn i{background:var(--warn)}.b-warn{color:var(--warn)}
+.b-bad i{background:var(--bad)}.b-bad{color:var(--bad)}
+.tag{font-size:11px;padding:1px 6px;border-radius:4px;background:var(--pri);color:var(--pri-t);margin-left:6px}
+.notice{padding:10px 14px;border-radius:8px;border:1px solid var(--warn);color:var(--warn);font-size:13px}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:13px}
+.empty{padding:48px 16px;text-align:center;color:var(--muted)}
+dialog{border:1px solid var(--line);border-radius:14px;background:var(--card);color:var(--text);padding:0;width:min(92vw,520px)}
+dialog::backdrop{background:rgba(0,0,0,.5)}
+dialog form,dialog .box{padding:20px;display:grid;gap:12px}
+dialog h3{margin:0}
+.row{display:flex;gap:8px}.row.end{justify-content:flex-end}
+pre{margin:0;background:var(--code);color:var(--code-t);padding:12px;border-radius:8px;overflow-x:auto;white-space:pre-wrap;word-break:break-all;font-size:12.5px}
+#toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%);background:var(--text);color:var(--bg);padding:9px 16px;border-radius:8px;opacity:0;pointer-events:none;transition:opacity .2s;z-index:50}
+#toast.show{opacity:1}
+@media (max-width:820px){main{grid-template-columns:1fr;padding:12px}.stats{grid-template-columns:repeat(3,1fr)}}
+</style>
+</head>
+<body>
+
+<div id="login" class="center" hidden>
+  <form class="card login" id="loginForm">
+    <h1>MeshLink</h1>
+    <p class="muted" style="margin:0">输入管理员密码登录控制台</p>
+    <input type="password" id="pw" placeholder="管理员密码" autocomplete="current-password" required>
+    <button class="btn pri" type="submit">登录</button>
+    <p class="err" id="loginErr"></p>
+  </form>
+</div>
+
+<div id="app" hidden>
+  <header>
+    <div class="brand">MeshLink <span class="muted" style="font-weight:400">组网控制台</span></div>
+    <button class="btn ghost sm" id="logout">退出登录</button>
+  </header>
+  <main>
+    <aside>
+      <div class="side-head"><b>虚拟网络</b><button class="btn sm pri" id="addNet">＋ 新增</button></div>
+      <div id="netList"></div>
+    </aside>
+    <section id="detail"></section>
+  </main>
+</div>
+
+<dialog id="dlg"></dialog>
+<div id="toast"></div>
+
+<script>
+const $ = (s) => document.querySelector(s);
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+let networks = [], nodes = [], curId = null, timer = null;
+
+async function api(path, method = 'GET', body) {
+  const r = await fetch('/api/admin' + path, {
+    method, credentials: 'same-origin',
+    headers: body ? { 'content-type': 'application/json' } : {},
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  let data = null;
+  try { data = await r.json(); } catch {}
+  if (r.status === 401 && path !== '/login') { showLogin(); throw new Error('登录已过期，请重新登录'); }
+  if (!r.ok) throw new Error((data && data.error) || 'HTTP ' + r.status);
+  return data;
+}
+
+function toast(msg) {
+  const t = $('#toast'); t.textContent = msg; t.classList.add('show');
+  clearTimeout(toast.t); toast.t = setTimeout(() => t.classList.remove('show'), 2200);
+}
+
+function ago(ts) {
+  if (!ts) return '从未';
+  const d = Math.floor(Date.now() / 1000) - ts;
+  if (d < 60) return '刚刚';
+  if (d < 3600) return Math.floor(d / 60) + ' 分钟前';
+  if (d < 86400) return Math.floor(d / 3600) + ' 小时前';
+  return Math.floor(d / 86400) + ' 天前';
+}
+
+function showLogin() { clearInterval(timer); $('#app').hidden = true; $('#login').hidden = false; $('#pw').focus(); }
+function showApp() { $('#login').hidden = true; $('#app').hidden = false; }
+
+$('#loginForm').onsubmit = async (e) => {
+  e.preventDefault();
+  $('#loginErr').textContent = '';
+  try {
+    await api('/login', 'POST', { password: $('#pw').value });
+    $('#pw').value = '';
+    await boot();
+  } catch (err) { $('#loginErr').textContent = err.message; }
+};
+$('#logout').onclick = async () => { try { await api('/logout', 'POST'); } catch {} showLogin(); };
+
+async function boot() {
+  try { await loadNetworks(); } catch { return showLogin(); }
+  showApp();
+  clearInterval(timer);
+  timer = setInterval(() => { if (!document.hidden && !$('#dlg').open) refresh(true); }, 15000);
+}
+
+async function loadNetworks() {
+  networks = (await api('/networks')).networks;
+  if (!networks.some((n) => n.id === curId)) curId = networks.length ? networks[0].id : null;
+  renderNets();
+  await loadNodes();
+}
+
+async function loadNodes() {
+  nodes = curId ? (await api(`/networks/${curId}/nodes`)).nodes : [];
+  renderDetail();
+}
+
+async function refresh(quiet) {
+  try { await loadNetworks(); } catch (e) { if (!quiet) toast(e.message); }
+}
+
+function renderNets() {
+  $('#netList').innerHTML = networks.length ? networks.map((n) => `
+    <div class="card net ${n.id === curId ? 'active' : ''}" data-id="${n.id}">
+      <b>${esc(n.name)}<span class="cnt">${n.online_count}/${n.node_count} 在线</span></b>
+      <small class="mono">${esc(n.cidr)} · ${n.mode === 'hub' ? '中心辐射' : '优先直连'}</small>
+    </div>`).join('') : '<div class="empty">还没有网络</div>';
+}
+$('#netList').onclick = (e) => {
+  const el = e.target.closest('.net'); if (!el) return;
+  curId = Number(el.dataset.id); renderNets(); loadNodes();
+};
+
+function statusBadge(n) {
+  if (!n.enabled) return '<span class="badge b-bad"><i></i>已禁用</span>';
+  if (!n.registered) return '<span class="badge b-warn"><i></i>待安装</span>';
+  return n.online ? '<span class="badge b-ok"><i></i>在线</span>' : '<span class="badge"><i></i>离线</span>';
+}
+
+const NAT_LABEL = { public: '公网', cone: '锥形', symmetric: '对称', unknown: '未知' };
+
+// NAT 类型 + 到各在线对端的路径统计（d 直连 / p 尝试中 / r 经 Hub 中转）
+function pathCell(n, net) {
+  if (!n.registered || !n.online) return '<span class="muted">-</span>';
+  const nat = n.nat_type
+    ? `<span class="badge ${n.nat_type === 'symmetric' ? 'b-warn' : ''}" title="STUN 探测到的 NAT 类型">${NAT_LABEL[n.nat_type] || '未知'}</span>` : '';
+  if (net.mode === 'hub') return `${nat} <span class="muted">经 Hub</span>`;
+  const byId = new Map(nodes.map((x) => [x.id, x]));
+  const live = (n.paths || []).filter((p) => byId.get(p.peer_id) && byId.get(p.peer_id).online);
+  const c = { d: 0, p: 0, r: 0 };
+  for (const p of live) if (p.state in c) c[p.state]++;
+  const relayNames = live.filter((p) => p.state === 'r').map((p) => byId.get(p.peer_id).name).join('、');
+  const parts = [];
+  if (c.d) parts.push(`<span style="color:var(--ok)">直连 ${c.d}</span>`);
+  if (c.p) parts.push(`<span class="muted">尝试中 ${c.p}</span>`);
+  if (c.r) parts.push(`<span style="color:var(--warn)" title="${esc('经 Hub 中转: ' + relayNames)}">中转 ${c.r}</span>`);
+  return nat + (parts.length ? ' ' + parts.join(' · ') : '');
+}
+
+function renderDetail() {
+  const net = networks.find((n) => n.id === curId);
+  if (!net) { $('#detail').innerHTML = '<div class="card empty">点击左侧“新增”创建第一个虚拟网络</div>'; return; }
+  const online = nodes.filter((n) => n.online).length;
+  const pending = nodes.filter((n) => !n.registered).length;
+  const noHub = net.mode !== 'hub' && !nodes.some((n) => n.is_hub && n.enabled);
+  const symNodes = nodes.filter((n) => n.online && n.nat_type === 'symmetric').map((n) => n.name);
+  const warn = noHub && symNodes.length
+    ? `<div class="notice">节点 ${esc(symNodes.join('、'))} 位于对称 NAT 后面，与其他 NAT 后的节点基本无法直连，但本网络还没有 Hub，无法自动中转。请把一个有公网 IP 的节点设为 Hub（编辑节点 → 勾选“这是 Hub”，并放行其 UDP 监听端口）。</div>` : '';
+  $('#detail').innerHTML = `
+    <div class="card panel head">
+      <div>
+        <h2>${esc(net.name)}</h2>
+        <div class="muted mono">${esc(net.cidr)} · ${net.mode === 'hub' ? '中心辐射（流量固定经 Hub 中转）' : '优先直连（打不通时自动经 Hub 中转）'}</div>
+      </div>
+      <div class="actions">
+        <button class="btn sm" data-a="addNode">＋ 添加节点</button>
+        <button class="btn sm" data-a="editNet">编辑网络</button>
+        <button class="btn sm danger" data-a="delNet">删除网络</button>
+      </div>
+    </div>
+    ${warn}
+    <div class="stats">
+      <div class="card stat"><div class="muted">节点总数</div><div class="n">${nodes.length}</div></div>
+      <div class="card stat"><div class="muted">在线</div><div class="n" style="color:var(--ok)">${online}</div></div>
+      <div class="card stat"><div class="muted">待安装</div><div class="n" style="color:var(--warn)">${pending}</div></div>
+    </div>
+    <div class="card panel">
+      ${nodes.length ? `<div class="tbl-wrap"><table>
+        <thead><tr><th>节点</th><th>虚拟 IP</th><th>状态</th><th>公网端点</th><th>NAT / 路径</th><th>内网网段</th><th>最后在线</th><th></th></tr></thead>
+        <tbody>${nodes.map((n) => `<tr>
+          <td><b>${esc(n.name)}</b>${n.is_hub ? '<span class="tag">Hub</span>' : ''}</td>
+          <td class="mono">${esc(n.ip)}</td>
+          <td>${statusBadge(n)}</td>
+          <td class="mono">${esc(n.endpoint_override || n.stun_endpoint || n.last_ip || '-')}</td>
+          <td>${pathCell(n, net)}</td>
+          <td class="mono">${esc(n.subnets || '-')}</td>
+          <td>${n.registered ? ago(n.last_seen) : '-'}</td>
+          <td class="actions" data-id="${n.id}">
+            ${n.enroll_token ? '<button class="btn sm pri" data-a="install">安装命令</button>' : ''}
+            <button class="btn sm" data-a="editNode">编辑</button>
+            <button class="btn sm" data-a="toggle">${n.enabled ? '禁用' : '启用'}</button>
+            <button class="btn sm" data-a="reset">重置</button>
+            <button class="btn sm danger" data-a="delNode">删除</button>
+          </td></tr>`).join('')}</tbody></table></div>`
+        : '<div class="empty">还没有节点，点击“添加节点”开始组网</div>'}
+    </div>`;
+}
+
+$('#detail').onclick = async (e) => {
+  const b = e.target.closest('[data-a]'); if (!b) return;
+  const a = b.dataset.a;
+  const nodeId = b.closest('[data-id]') ? Number(b.closest('[data-id]').dataset.id) : null;
+  const node = nodes.find((n) => n.id === nodeId);
+  const net = networks.find((n) => n.id === curId);
+  try {
+    if (a === 'addNode') nodeForm();
+    else if (a === 'editNet') netForm(net);
+    else if (a === 'delNet') {
+      if (confirm(`确定删除网络“${net.name}”及其全部 ${nodes.length} 个节点？此操作不可恢复。`)) {
+        await api(`/networks/${net.id}`, 'DELETE'); toast('已删除'); await loadNetworks();
+      }
+    }
+    else if (a === 'install') showInstall(node);
+    else if (a === 'editNode') nodeForm(node);
+    else if (a === 'toggle') { await api(`/nodes/${nodeId}`, 'PUT', { enabled: !node.enabled }); await refresh(); }
+    else if (a === 'reset') {
+      if (confirm(`重置“${node.name}”？旧凭证立即失效，节点会断开，需用新命令重新安装。`)) {
+        await api(`/nodes/${nodeId}/reset`, 'POST'); await refresh();
+        showInstall(nodes.find((n) => n.id === nodeId));
+      }
+    }
+    else if (a === 'delNode') {
+      if (confirm(`确定删除节点“${node.name}”？`)) { await api(`/nodes/${nodeId}`, 'DELETE'); toast('已删除'); await refresh(); }
+    }
+  } catch (err) { toast(err.message); }
+};
+
+function openForm(title, body, onSubmit, okText = '保存') {
+  const d = $('#dlg');
+  d.innerHTML = `<form><h3>${title}</h3>${body}<p class="err"></p>
+    <div class="row end"><button type="button" class="btn ghost" data-close>取消</button><button class="btn pri">${okText}</button></div></form>`;
+  const f = d.querySelector('form');
+  f.onsubmit = async (e) => {
+    e.preventDefault();
+    try { await onSubmit(new FormData(f)); d.close(); } catch (err) { f.querySelector('.err').textContent = err.message; }
+  };
+  d.querySelector('[data-close]').onclick = () => d.close();
+  d.showModal();
+}
+
+function netForm(net) {
+  const edit = !!net;
+  openForm(edit ? '编辑网络' : '新增虚拟网络', `
+    <label>网络名称<input name="name" value="${esc(net?.name)}" required maxlength="40"></label>
+    <label>网段 (CIDR)<input name="cidr" value="${esc(net?.cidr || '10.88.0.0/24')}" ${edit ? 'readonly' : ''} required class="mono"></label>
+    <label>组网模式<select name="mode">
+      <option value="mesh" ${net?.mode !== 'hub' ? 'selected' : ''}>优先直连 — 能直连就直连，打不通自动经 Hub 中转（推荐）</option>
+      <option value="hub" ${net?.mode === 'hub' ? 'selected' : ''}>中心辐射 — 流量固定经公网 Hub 中转</option>
+    </select></label>`, async (f) => {
+    const body = { name: f.get('name'), cidr: f.get('cidr'), mode: f.get('mode') };
+    if (edit) await api(`/networks/${net.id}`, 'PUT', body);
+    else curId = (await api('/networks', 'POST', body)).id;
+    toast('已保存'); await loadNetworks();
+  });
+}
+
+function nodeForm(node) {
+  const edit = !!node;
+  openForm(edit ? '编辑节点' : '添加节点', `
+    <label>节点名称<input name="name" value="${esc(node?.name)}" required maxlength="40" placeholder="例如 office-sh"></label>
+    <label>WireGuard 监听端口<input name="listen_port" type="number" min="1" max="65535" value="${node?.listen_port || 51820}"></label>
+    <label class="inline"><input type="checkbox" name="is_hub" ${node?.is_hub ? 'checked' : ''}> 这是 Hub（有公网 IP，直连失败的节点会经它中转）</label>
+    <label>该节点后面的内网网段（可选，逗号分隔）<input name="subnets" value="${esc(node?.subnets)}" placeholder="192.168.1.0/24" class="mono"></label>
+    <label>手动指定对外地址（可选，默认用 STUN 自动探测的公网端点）<input name="endpoint_override" value="${esc(node?.endpoint_override)}" placeholder="vpn.example.com 或 1.2.3.4:51820" class="mono"></label>`,
+  async (f) => {
+    const body = {
+      name: f.get('name'), listen_port: Number(f.get('listen_port')), is_hub: f.get('is_hub') === 'on',
+      subnets: f.get('subnets') || '', endpoint_override: f.get('endpoint_override') || '',
+    };
+    if (edit) { await api(`/nodes/${node.id}`, 'PUT', body); toast('已保存'); await refresh(); }
+    else {
+      const id = (await api(`/networks/${curId}/nodes`, 'POST', body)).id;
+      await refresh();
+      showInstall(nodes.find((n) => n.id === id));
+    }
+  }, edit ? '保存' : '创建');
+}
+
+function showInstall(node) {
+  if (!node || !node.enroll_token) return;
+  const o = location.origin;
+  const cmd = `curl -fsSL ${o}/agent.sh | sudo bash -s -- install --server ${o} --token ${node.enroll_token}`;
+  const d = $('#dlg');
+  d.innerHTML = `<div class="box">
+    <h3>安装节点“${esc(node.name)}”</h3>
+    <p class="muted" style="margin:0">在该节点的 Linux 机器上以 root 执行下面的命令（需要 systemd；会自动安装 wireguard-tools）。令牌一次性有效。</p>
+    <pre id="cmd">${esc(cmd)}</pre>
+    <p class="muted" style="margin:0">虚拟 IP: <span class="mono">${esc(node.ip)}</span></p>
+    <div class="row end"><button class="btn" id="cp">复制命令</button><button class="btn pri" data-close>完成</button></div></div>`;
+  d.querySelector('#cp').onclick = async () => {
+    try { await navigator.clipboard.writeText(cmd); toast('已复制'); } catch { toast('请手动选中复制'); }
+  };
+  d.querySelector('[data-close]').onclick = () => d.close();
+  d.showModal();
+}
+
+$('#addNet').onclick = () => netForm();
+boot();
+</script>
+</body>
+</html>
