@@ -765,7 +765,7 @@ export default {
     try {
       if (url.pathname.startsWith('/api/agent/')) return await handleAgent(request, env, url);
       if (url.pathname.startsWith('/api/admin/')) return await handleAdmin(request, env, url);
-      if (url.pathname === '/healthz') return textResp('ok');
+      if (url.pathname === '/healthz') return textResp('ok v2.3\n');
       return await env.ASSETS.fetch(request);
     } catch (e) {
       if (e instanceof HttpError) {
