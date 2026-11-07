@@ -439,7 +439,14 @@ async function clientInfo(env, net) {
   const c = parseCidr(net.cidr);
   const allowed = [`${intToIp(c.net)}/${c.bits}`];
   for (const n of results) if (n.subnets) allowed.push(...n.subnets.split(','));
-  return { hub_name: hub.name, hub_public_key: hub.public_key, endpoint, allowed_ips: [...new Set(allowed)].join(', ') };
+  // Hub 有公网 IPv6 时（没手动指定对外地址）额外给出 IPv6 端点：手机在蜂窝网络上通常有 IPv6，走 IPv6 不经过运营商的 CGNAT，
+  // 丢包和延迟都明显更好；WireGuard App 的 Endpoint 只能填一个，所以由后台界面让人选 IPv6 还是 IPv4。
+  const v6 = hub.endpoint_override ? '' : v6Of(hub);
+  return {
+    hub_name: hub.name, hub_public_key: hub.public_key, endpoint,
+    endpoint_v6: v6 ? `[${v6}]:${hub.listen_port}` : '',
+    allowed_ips: [...new Set(allowed)].join(', '),
+  };
 }
 
 async function insertClient(env, net, name, ip, pub) {
@@ -881,7 +888,8 @@ async function handleAdmin(request, env, url) {
   }
 
   if ((m = path.match(/^\/networks\/(\d+)\/clients$/)) && method === 'POST') {
-    return jsonResp(await createClient(env, Number(m[1]), await readJson(request)), 201);
+    const viewerV6 = (request.headers.get('CF-Connecting-IP') || '').includes(':');   // 管理员浏览器所在网络有没有 IPv6
+    return jsonResp({ ...(await createClient(env, Number(m[1]), await readJson(request))), viewer_v6: viewerV6 }, 201);
   }
 
   if ((m = path.match(/^\/nodes\/(\d+)\/client$/)) && method === 'PUT') {
@@ -891,7 +899,7 @@ async function handleAdmin(request, env, url) {
     const pub = validPubKey((await readJson(request)).public_key);
     const info = await clientInfo(env, net);
     await env.DB.prepare('UPDATE nodes SET public_key=? WHERE id=?').bind(pub, n.id).run();
-    return jsonResp({ id: n.id, ip: n.ip, ...info });
+    return jsonResp({ id: n.id, ip: n.ip, ...info, viewer_v6: (request.headers.get('CF-Connecting-IP') || '').includes(':') });
   }
 
   if ((m = path.match(/^\/nodes\/(\d+)$/))) {

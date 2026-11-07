@@ -584,6 +584,84 @@ class FamilyDaemonTests(unittest.TestCase):
 
 
 # ───────── 延迟测量 ─────────
+
+class LossFailoverTests(unittest.TestCase):
+    """直连能通但丢包严重时，自动改走 Hub；带停留时间和退避，避免来回抖动。"""
+    def healthy(self, t):
+        return dump(t, a_hs=int(t) - 10, a_rx=int(t))
+
+    def tick(self, pm, t, a_loss=None, hub_loss=None, n=20):
+        losses = {}
+        if a_loss is not None:
+            losses[A] = (a_loss, n)
+        if hub_loss is not None:
+            losses[HUB] = (hub_loss, n)
+        return pm.tick(t, SELF, peers(), self.healthy(t), 'cone', losses)
+
+    def test_high_loss_moves_to_hub(self):
+        pm = mp.PathManager()
+        r = self.tick(pm, 1000, a_loss=5, hub_loss=0)
+        self.assertEqual(r['labels'][A], 'd')
+        r = self.tick(pm, 1005, a_loss=40, hub_loss=0)
+        self.assertEqual(r['labels'][A], 'r')
+        self.assertEqual(r['desired'][A], [])
+        self.assertIn('丢包', r['events'][0])
+
+    def test_needs_enough_samples_and_threshold(self):
+        pm = mp.PathManager()
+        self.assertEqual(self.tick(pm, 1000, a_loss=80, hub_loss=0, n=5)['labels'][A], 'd')    # 样本太少
+        self.assertEqual(self.tick(pm, 1005, a_loss=20, hub_loss=0)['labels'][A], 'd')         # 没到阈值
+
+    def test_not_worth_it_when_hub_is_just_as_bad(self):
+        pm = mp.PathManager()
+        self.assertEqual(self.tick(pm, 1000, a_loss=40, hub_loss=35)['labels'][A], 'd')        # Hub 也丢，切过去没意义
+        self.assertEqual(self.tick(pm, 1005, a_loss=40, hub_loss=10)['labels'][A], 'r')
+
+    def test_hold_blocks_recovery_then_allows(self):
+        pm = mp.PathManager()
+        self.tick(pm, 1000, a_loss=0, hub_loss=0)
+        self.tick(pm, 1005, a_loss=40, hub_loss=0)                    # 切到中转，至少停留 LOSS_HOLD_BASE 秒
+        t, back = 1010, None
+        while t < 1005 + mp.LOSS_HOLD_BASE - 5:
+            r = pm.tick(t, SELF, peers(), dump(t, a_hs=t - 1, a_rx=int(t)), 'cone', {A: (3, 20), HUB: (0, 20)})
+            self.assertEqual(r['labels'][A], 'r', t)                  # 握手很新也不切回
+            t += 5
+        while t < 1005 + mp.LOSS_HOLD_BASE + 60:
+            r = pm.tick(t, SELF, peers(), dump(t, a_hs=t - 1, a_rx=int(t)), 'cone', {A: (3, 20), HUB: (0, 20)})
+            if r['labels'][A] == 'd':
+                back = t
+                break
+            t += 5
+        self.assertIsNotNone(back)                                    # 停留期结束后可以回直连
+
+    def test_hold_cancelled_when_relay_is_no_better(self):
+        pm = mp.PathManager()
+        self.tick(pm, 1000, a_loss=0, hub_loss=0)
+        self.tick(pm, 1005, a_loss=40, hub_loss=0)
+        r = None
+        for t in range(1010, 1100, 5):
+            r = pm.tick(t, SELF, peers(), dump(t, a_hs=t - 1, a_rx=int(t)), 'cone', {A: (50, 20), HUB: (0, 20)})
+            if r['labels'][A] == 'd':
+                break
+        self.assertEqual(r['labels'][A], 'd')                         # 中转丢包 50% 比直连的 40% 还差，不必等满停留期
+
+    def test_backoff_doubles(self):
+        pm = mp.PathManager()
+        self.tick(pm, 1000, a_loss=0, hub_loss=0)
+        self.tick(pm, 1005, a_loss=40, hub_loss=0)
+        self.assertEqual(pm.st[A]['hold_until'], 1005 + mp.LOSS_HOLD_BASE)
+        # 取消停留、回到直连后再次丢包：停留时间翻倍
+        pm.st[A].update(mode='direct', since=2000, rx_t=2000, hold_until=0)
+        r = pm.tick(2005, SELF, peers(), self.healthy(2005), 'cone', {A: (40, 20), HUB: (0, 20)})
+        self.assertEqual(r['labels'][A], 'r')
+        self.assertEqual(pm.st[A]['hold_until'], 2005 + mp.LOSS_HOLD_BASE * 2)
+
+    def test_hub_node_unmanaged(self):
+        pm = mp.PathManager()
+        r = pm.tick(1000, {'mode': 'mesh', 'hub': '1'}, peers(), self.healthy(1000), 'cone', {A: (90, 20), HUB: (0, 20)})
+        self.assertEqual(r['desired'][A], ['10.88.0.3/32', '192.168.7.0/24'])    # Hub 自己没有中转可退
+
+
 class PingHelperTests(unittest.TestCase):
     def test_echo_checksum_is_valid(self):
         pkt = mp.icmp_echo(0x1234, 7)
@@ -711,7 +789,8 @@ class LatencyDaemonTests(unittest.TestCase):
         self.values[0] = (20.0, 5, 1)                                # 5 个包丢 1 个；窗口内累计 1/10 = 10%
         self.tick(mp.LAT_INTERVAL)
         self.assertEqual(self.item('3'), '3:d:20::10')
-        self.assertEqual(json.load(open(os.path.join(self.tmp, 'status.json')))['peers'][1]['loss'], 10)
+        with open(os.path.join(self.tmp, 'status.json')) as f:
+            self.assertEqual(json.load(f)['peers'][1]['loss'], 10)
         self.values[0] = (20.0, 5, 0)                                # 2/15 -> 13%，变化不到 5 个点: 上报值保持 10
         self.tick(mp.LAT_INTERVAL)
         self.assertEqual(self.item('3'), '3:d:20::10')

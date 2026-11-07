@@ -593,3 +593,25 @@ test('config: 隧道 MTU 1380、保活 15 秒，Hub 带 MSS 钳制', async () =>
   assert.match(r.text, /^PersistentKeepalive = 15$/m);
   assert.match(r.text, /TCPMSS --clamp-mss-to-pmtu/);
 });
+
+test('客户端: Hub 有 IPv6 时额外给出 IPv6 端点，并告诉界面浏览器所在网络有没有 IPv6', async () => {
+  const { env, cookie, net, nodes } = await setup();
+  const syncWith = (node, cf, v6) => worker.fetch(new Request('https://mesh.example/api/agent/sync', {
+    method: 'POST', headers: { Authorization: `Bearer ${node.secret}`, 'CF-Connecting-IP': cf, ...(v6 ? { 'X-Meshlink-IPv6': v6 } : {}) },
+  }), env);
+  await syncWith(nodes.hub1, '198.51.100.1');                           // 只有 IPv4
+  let r = await addClient(env, cookie, net, 'phone', 'P');
+  assert.equal(r.status, 201);
+  assert.equal(r.json.endpoint_v6, '');
+  assert.equal(r.json.viewer_v6, false);
+  await syncWith(nodes.hub1, '198.51.100.1', '2408:8207:1::1');         // 现在 Hub 也有 IPv6
+  const viaV6 = await worker.fetch(new Request(`https://mesh.example/api/admin/networks/${net}/clients`, {
+    method: 'POST', headers: { Cookie: cookie, 'CF-Connecting-IP': '2409:8a00::9', 'content-type': 'application/json' },
+    body: JSON.stringify({ name: 'phone2', public_key: pubKey('Q') }),
+  }), env);
+  const j = await viaV6.json();
+  assert.equal(viaV6.status, 201);
+  assert.match(j.endpoint, /^198\.51\.100\.1:\d+$/);
+  assert.match(j.endpoint_v6, /^\[2408:8207:1::1\]:\d+$/);
+  assert.equal(j.viewer_v6, true);
+});

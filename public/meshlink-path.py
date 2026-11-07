@@ -51,6 +51,12 @@ PROBE_EVERY = 45       # 秒；中转状态下每隔多久主动触发一次直�
 RELAY_MIN_DWELL = 30   # 秒；进入中转后至少停留多久才允许切回直连
 RECOVER_FRESH = 60     # 秒；切回直连要求握手新鲜度
 RECOVER_OK = 2         # 连续几次检查都满足才切回，防抖
+LOSS_RELAY = 25        # %；直连丢包率达到这个值，且经 Hub 中转明显更好时，改走 Hub 中转
+LOSS_MARGIN = 15       # 个百分点；Hub 那条路丢包率至少要比直连低这么多才值得切
+LOSS_MIN_SAMPLES = 10  # 窗口内至少有这么多个探测包才信任丢包率（5 个包的样本太抖）
+LOSS_HOLD_BASE = 300   # 秒；因丢包切到中转后，至少停留这么久才允许试着切回直连；每再次因丢包切走一次翻倍
+LOSS_HOLD_MAX = 1800   # 秒；上限
+LOSS_STABLE = 600      # 秒；直连连续这么久丢包都低，就把退避次数清零
 REPORT_HEARTBEAT = 900  # 秒；状态没变化时的心跳上报间隔（控制面 30 分钟后视 STUN 结果过期）
 REPORT_MIN_GAP = 5
 REPORT_RETRY = 30
@@ -468,7 +474,8 @@ class PathManager:
         return {'mode': mode, 'since': t, 'rx_t': t, 'rx': None, 'relay_at': t if mode == 'relay' else 0,
                 'ok': 0, 'probe_at': t, 'ep': None}
 
-    def tick(self, t, selfm, peers, dump, self_nat):
+    def tick(self, t, selfm, peers, dump, self_nat, losses=None):
+        losses = losses or {}      # pub -> (丢包率 %, 窗口内探测包数)
         desired = {p['pub']: list(p['allowed']) for p in peers}
         res = {'desired': desired, 'kicks': [], 'labels': {}, 'newly_relayed': False, 'events': [], 'relay_hub': None,
                'endpoints': {}}
@@ -539,9 +546,30 @@ class PathManager:
                         s.update(mode='relay', relay_at=t, ok=0, probe_at=t)
                         res['newly_relayed'] = True
                         res['events'].append('对端 %s 直连失败（%s），改走 Hub 中转' % (p['name'] or pub[:8], why))
+                    elif have and hub_ok:
+                        # 直连能通但丢包严重：Hub 那条路明显更好（或还没测过）就改走 Hub；
+                        # 切走后至少停留 hold 秒（连续因丢包切走时翻倍），避免来回抖动
+                        li, hl = losses.get(pub), losses.get(relay_hub['pub'])
+                        enough = li is not None and li[1] >= LOSS_MIN_SAMPLES
+                        if enough and li[0] >= LOSS_RELAY and (
+                                hl is None or hl[1] < LOSS_MIN_SAMPLES or hl[0] + LOSS_MARGIN <= li[0]):
+                            n = s.get('hold_n', 0)
+                            hold = min(LOSS_HOLD_BASE * (2 ** n), LOSS_HOLD_MAX)
+                            s.update(mode='relay', relay_at=t, ok=0, probe_at=t, hold_until=t + hold,
+                                     hold_n=n + 1, direct_loss=li[0])
+                            res['events'].append('对端 %s 直连丢包 %d%%，改走 Hub 中转（Hub 丢包 %s），至少停留 %d 秒' % (
+                                p['name'] or pub[:8], li[0], '%d%%' % hl[0] if hl else '未知', hold))
+                        elif enough and li[0] < LOSS_RELAY // 2 and t - s['since'] > LOSS_STABLE:
+                            s['hold_n'] = 0             # 直连稳定了，下次再出问题从最短的停留时间开始
             else:
+                held = t < s.get('hold_until', 0)
+                if held:
+                    rl = losses.get(pub)                # 中转状态下测到的是经 Hub 这条路的丢包率
+                    if rl is not None and rl[1] >= LOSS_MIN_SAMPLES and rl[0] >= s.get('direct_loss', 0):
+                        s['hold_until'], held = 0, False    # 中转也没有比直连好，不用再等
+                        res['events'].append('对端 %s 经 Hub 中转丢包 %d%% 也不比直连好，允许切回直连' % (p['name'] or pub[:8], rl[0]))
                 fresh = d['hs'] > s['relay_at'] and a is not None and a < RECOVER_FRESH
-                s['ok'] = s['ok'] + 1 if (fresh and t - s['relay_at'] >= RELAY_MIN_DWELL) else 0
+                s['ok'] = s['ok'] + 1 if (fresh and not held and t - s['relay_at'] >= RELAY_MIN_DWELL) else 0
                 if s['ok'] >= RECOVER_OK:
                     s.update(mode='direct', since=t, rx_t=t, ok=0)
                     f = self.fam.get(pub)
@@ -834,6 +862,13 @@ class Daemon:
         if old is None or abs(pct - old) >= 5 or (pct == 0) != (old == 0):
             self.loss_rep[pub] = pct
 
+    def loss_info(self, pub):
+        """(丢包率 %, 窗口内探测包数)；还没测过返回 None。"""
+        h = self.loss_hist.get(pub)
+        if not h:
+            return None
+        return self.loss_pct(pub), sum(x[1] for x in h)
+
     def loss_pct(self, pub):
         h = self.loss_hist.get(pub)
         if not h:
@@ -892,7 +927,12 @@ class Daemon:
                 return
             dev, dump = d
 
-        res = self.pm.tick(t, selfm, peers, dump, self.nat)
+        losses = {}
+        for pub in dump:
+            li = self.loss_info(pub)
+            if li:
+                losses[pub] = li
+        res = self.pm.tick(t, selfm, peers, dump, self.nat, losses)
         for ev in res['events']:
             log(ev)
         if res['newly_relayed']:

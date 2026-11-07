@@ -450,6 +450,10 @@ function epCell(n) {
   const rows = [];
   if (n.ipv4) rows.push(`<div>${tag('v4')}${esc(n.ipv4)}${geoLine(n.ipv4_info)}</div>`);
   if (n.ipv6) rows.push(`<div style="margin-top:4px">${tag('v6')}${esc(n.ipv6)}${geoLine(n.ipv6_info)}</div>`);
+  // 节点在线却没有上报公网 IPv6：提示一下，节点之间只能走 IPv4（要排查就在节点上执行 meshlink-agent ipv6）
+  if (!n.ipv6 && n.registered && n.online && !n.observed) {
+    rows.push('<div class="muted" style="margin-top:4px;font-size:12px" title="该节点没有可用的公网 IPv6，节点之间只能走 IPv4。\n在节点上执行 meshlink-agent ipv6 可以看到原因（路由器没开 IPv6 / 只有内网 IPv6 地址等）。Docker 方式安装的执行 docker exec meshlink meshlink-agent ipv6。">IPv6：未检测到</div>');
+  }
   return rows.length ? rows.join('') : '-';
 }
 
@@ -573,26 +577,49 @@ function genKeyPair() {
   return { priv: b64(priv), pub: b64(x25519(priv, base)) };
 }
 
-function clientConf(info, priv) {
-  return ['[Interface]', `PrivateKey = ${priv}`, `Address = ${info.ip}/32`, 'MTU = 1380', '',
+// 手机的 MTU 固定 1280：蜂窝网络的外层 MTU 常常只有 1400 上下，1280 是 IPv6 的最小 MTU，任何路径都能过，
+// 双向的 TCP 报文也因此都不会超过它，避免“能 ping 通但网页打不开”。
+function clientConf(info, priv, v6) {
+  return ['[Interface]', `PrivateKey = ${priv}`, `Address = ${info.ip}/32`, 'MTU = 1280', '',
     '[Peer]', `PublicKey = ${info.hub_public_key}`, `AllowedIPs = ${info.allowed_ips}`,
-    `Endpoint = ${info.endpoint}`, 'PersistentKeepalive = 25', ''].join('\n');
+    `Endpoint = ${v6 && info.endpoint_v6 ? info.endpoint_v6 : info.endpoint}`, 'PersistentKeepalive = 25', ''].join('\n');
 }
 
-function showClientConf(name, info, conf) {
+function showClientConf(name, info, priv) {
   const d = $('#dlg');
+  const hasV6 = !!info.endpoint_v6;
+  // Hub 有 IPv6 且当前浏览器所在的网络也有 IPv6（在手机上打开后台就是手机的网络）时默认走 IPv6
+  let v6 = hasV6 && !!info.viewer_v6;
+  let conf = '';
   const file = ('ml-' + (name.replace(/[^A-Za-z0-9_.-]/g, '') || 'client')).slice(0, 15) + '.conf';
   d.innerHTML = `<div class="box">
     <h3>“${esc(name)}”的接入配置</h3>
     <p class="muted" style="margin:0">手机：打开官方 WireGuard App → “+” → 扫描二维码。电脑：在 WireGuard 里“导入隧道”选择下载的 .conf 文件。
     <b>私钥只在这里显示这一次</b>（服务器不保存），关闭后如需重装请点“重新生成配置”。</p>
+    ${hasV6 ? `<div class="row" style="align-items:center;flex-wrap:wrap">
+      <button type="button" class="btn sm" data-fam="6">IPv6 接入</button>
+      <button type="button" class="btn sm" data-fam="4">IPv4 接入</button>
+      <span class="muted" id="famHint" style="font-size:12.5px"></span></div>` : ''}
     <div id="qr"></div>
-    <pre id="cmd">${esc(conf)}</pre>
-    <p class="muted" style="margin:0">虚拟 IP: <span class="mono">${esc(info.ip)}</span> · 接入 Hub: ${esc(info.hub_name)} (${esc(info.endpoint)})</p>
+    <pre id="cmd"></pre>
+    <p class="muted" style="margin:0">虚拟 IP: <span class="mono">${esc(info.ip)}</span> · 接入 Hub: ${esc(info.hub_name)} (<span id="epText"></span>)</p>
     <div class="row end"><button class="btn" id="cp">复制配置</button><button class="btn" id="dl">下载 ${esc(file)}</button><button class="btn pri" data-close>完成</button></div></div>`;
-  try {
-    new QRCode(d.querySelector('#qr'), { text: conf, width: 240, height: 240, correctLevel: QRCode.CorrectLevel.L });
-  } catch { d.querySelector('#qr').textContent = '二维码生成失败（二维码库未加载），请用下方的复制或下载'; }
+  const draw = () => {
+    conf = clientConf(info, priv, v6);
+    d.querySelector('#cmd').textContent = conf;
+    d.querySelector('#epText').textContent = v6 && hasV6 ? info.endpoint_v6 : info.endpoint;
+    const qr = d.querySelector('#qr'); qr.innerHTML = '';
+    try {
+      new QRCode(qr, { text: conf, width: 240, height: 240, correctLevel: QRCode.CorrectLevel.L });
+    } catch { qr.textContent = '二维码生成失败（二维码库未加载），请用下方的复制或下载'; }
+    d.querySelectorAll('[data-fam]').forEach((b) => b.classList.toggle('pri', (b.dataset.fam === '6') === v6));
+    const h = d.querySelector('#famHint');
+    if (h) h.textContent = v6
+      ? '不经过运营商 NAT，通常延迟和丢包更好；手机当前网络没有 IPv6 就连不上，请改选 IPv4。'
+      : (info.viewer_v6 ? '' : '当前浏览器的网络没有检测到 IPv6；如果手机的网络有 IPv6，建议选 IPv6 接入。');
+  };
+  d.querySelectorAll('[data-fam]').forEach((b) => { b.onclick = () => { v6 = b.dataset.fam === '6'; draw(); }; });
+  draw();
   d.querySelector('#cp').onclick = async () => {
     try { await navigator.clipboard.writeText(conf); toast('已复制'); } catch { toast('请手动选中复制'); }
   };
@@ -613,7 +640,7 @@ function clientForm() {
     const kp = genKeyPair();
     const info = await api(`/networks/${curId}/clients`, 'POST', { name, public_key: kp.pub });
     await refresh();
-    showClientConf(name, info, clientConf(info, kp.priv));
+    showClientConf(name, info, kp.priv);
   }, '生成配置');
 }
 
@@ -640,7 +667,7 @@ async function regenClient(node, skipConfirm) {
   const kp = genKeyPair();
   const info = await api(`/nodes/${node.id}/client`, 'PUT', { public_key: kp.pub });
   await refresh();
-  showClientConf(node.name, info, clientConf(info, kp.priv));
+  showClientConf(node.name, info, kp.priv);
 }
 
 $('#addNet').onclick = () => netForm();

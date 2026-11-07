@@ -331,6 +331,26 @@ cmd_ipv6() {
   else
     echo "  （无）没有可用的公网 IPv6：没有 IPv6 默认路由，或只有 ULA(fd..)/链路本地(fe80..) 地址"
   fi
+  echo "== IPv6 出网实测 =="
+  [ -f "$ENV_FILE" ] && { # shellcheck disable=SC1090
+    . "$ENV_FILE"; }
+  if command -v curl >/dev/null 2>&1; then
+    if curl -6 -sS --max-time 6 -o /dev/null "https://[2606:4700:4700::1111]/" 2>/dev/null; then
+      echo "  经 IPv6 访问 Cloudflare：通"
+    elif [ -n "${SERVER:-}" ] && curl -6 -sS --max-time 6 -o /dev/null "$SERVER/healthz" 2>/dev/null; then
+      echo "  经 IPv6 访问控制面：通"
+    else
+      echo "  经 IPv6 访问外网：不通（有地址但出不去：检查 IPv6 默认路由、路由器是否开启 IPv6 / DHCPv6-PD）"
+    fi
+  else
+    echo "  没有 curl，跳过"
+  fi
+  local port
+  port=$(sed -n 's/^ListenPort[[:space:]]*=[[:space:]]*\([0-9]\{1,5\}\).*/\1/p' "/etc/wireguard/${IFACE:-meshlink}.conf" 2>/dev/null | head -n1)
+  echo "== 入站提示 =="
+  echo "  节点之间走 IPv6 直连，需要这台机器的 UDP ${port:-<监听端口>} 能从公网入站。agent 会放行本机 fw4 防火墙，"
+  echo "  但家宽路由器（光猫 / 上级路由）的“IPv6 防火墙”默认通常拦截入站，需要在那里放行该 UDP 端口（或关闭 IPv6 入站过滤）。"
+  echo "  放行不了也没关系：IPv6 打不通会在约 20 秒后自动改试 IPv4。"
   echo "== 路径管理器（IPv6 优先、IPv4 兜底依赖它） =="
   if [ -f "$PYBIN" ] && have_python; then echo "  已安装"; else echo "  未安装或没有 python3：只会使用 IPv4"; fi
 }
