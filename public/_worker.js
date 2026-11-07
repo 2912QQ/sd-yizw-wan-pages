@@ -241,6 +241,145 @@ async function readJson(request) {
   throw new HttpError(400, '请求格式错误');
 }
 
+// ───────────────────────── IP 归属地 / 运营商 ─────────────────────────
+// 后台“公网端点”列在每个公网地址下面显示运营商与归属地。
+// 数据来自免费的 IP 库（ip-api.com，失败时退回 ipwho.is），结果缓存在 D1 的 ip_info 表里（成功 7 天，失败 10 分钟后重试），
+// 只在管理员打开后台、且缓存里没有时才会查询（每次请求最多查 IP_LOOKUP_MAX 个，其余下次刷新补上），不影响节点同步。
+// 私网 / 保留地址和域名不查询。设置变量 IPINFO_DISABLED=1 可整体关闭。
+const IPINFO_TTL = 7 * 86400;    // 秒；成功结果的缓存时间
+const IPINFO_RETRY = 600;        // 秒；查询失败后的重试间隔
+const IP_LOOKUP_MAX = 6;         // 单次后台请求最多发起的外部查询数
+const IP_LOOKUP_TIMEOUT = 2500;  // 毫秒
+
+// 从 "1.2.3.4"、"1.2.3.4:51820"、"[2408::1]:51820"、"2408::1" 里取出 IP 字面量；域名返回空
+function hostOf(v) {
+  const s = String(v ?? '').trim();
+  let m = /^\[([0-9a-fA-F:]+)\](?::\d{1,5})?$/.exec(s);
+  if (m) return m[1].toLowerCase();
+  m = /^(\d{1,3}(?:\.\d{1,3}){3})(?::\d{1,5})?$/.exec(s);
+  if (m) return m[1];
+  if (/^[0-9a-fA-F:]+$/.test(s) && s.split(':').length > 2) return s.toLowerCase();
+  return '';
+}
+
+// 只查公网单播地址：排除私网、CGNAT、回环、链路本地、文档/测试网段、组播
+function isPublicIp(ip) {
+  if (!ip) return false;
+  if (ip.includes(':')) return normIpv6(ip) !== '' && !/^2001:0?db8:/.test(ip) && !/^::ffff:/.test(ip);
+  const n = ipToInt(ip);
+  if (n === null) return false;
+  const in_ = (base, bits) => ((n & ((0xffffffff << (32 - bits)) >>> 0)) >>> 0) === ipToInt(base);
+  if (n >>> 24 >= 224) return false;
+  return ![['0.0.0.0', 8], ['10.0.0.0', 8], ['100.64.0.0', 10], ['127.0.0.0', 8], ['169.254.0.0', 16], ['172.16.0.0', 12],
+    ['192.0.0.0', 24], ['192.0.2.0', 24], ['192.168.0.0', 16], ['198.18.0.0', 15], ['198.51.100.0', 24], ['203.0.113.0', 24]]
+    .some(([b, bits]) => in_(b, bits));
+}
+
+const cleanStr = (v, max = 80) => String(v ?? '').replace(/[\u0000-\u001f<>]/g, '').trim().slice(0, max);
+
+// 把各种英文 ISP 名称归一成常见中文叫法；认不出来就原样返回
+function carrierOf(isp) {
+  const s = String(isp || '');
+  const rules = [
+    [/china ?telecom|chinanet|\bctcc\b|\bchina ?tele\b|中国电信/i, '中国电信'],
+    [/china ?unicom|\bcncgroup\b|china169|\bcnc ?group\b|中国联通/i, '中国联通'],
+    [/china ?mobile|\bcmnet\b|\bcmcc\b|中国移动/i, '中国移动'],
+    [/china ?broadnet|china ?broadcast|\bcbn\b|中国广电/i, '中国广电'],
+    [/china ?railcom|china ?tietong|铁通/i, '中国铁通'],
+    [/cernet|education (and|&) research network|教育网/i, '教育网'],
+    [/drpeng|great wall broadband|鹏博士|长城宽带/i, '鹏博士'],
+    [/alibaba|aliyun|hangzhou alibaba/i, '阿里云'],
+    [/tencent|腾讯/i, '腾讯云'],
+    [/huawei cloud|huawei/i, '华为云'],
+    [/amazon|\baws\b/i, 'Amazon AWS'],
+    [/cloudflare/i, 'Cloudflare'],
+    [/google/i, 'Google'],
+    [/microsoft|azure/i, 'Microsoft'],
+  ];
+  for (const [re, name] of rules) if (re.test(s)) return name;
+  return cleanStr(s);
+}
+
+async function fetchIpInfo(ip) {
+  const getJson = async (url) => {
+    const r = await fetch(url, { signal: AbortSignal.timeout(IP_LOOKUP_TIMEOUT), headers: { accept: 'application/json' } });
+    if (!r.ok) throw new Error('http ' + r.status);
+    return r.json();
+  };
+  try {
+    const j = await getJson(`http://ip-api.com/json/${encodeURIComponent(ip)}?lang=zh-CN&fields=status,country,countryCode,regionName,city,isp,org,as`);
+    if (j && j.status === 'success') {
+      return { country: j.country, cc: j.countryCode, region: j.regionName, city: j.city, isp: j.isp || j.org, asn: (/^AS(\d+)/i.exec(j.as || '') || [])[1] };
+    }
+  } catch { /* 退回备用接口 */ }
+  try {
+    const j = await getJson(`https://ipwho.is/${encodeURIComponent(ip)}?lang=zh-CN&fields=success,country,country_code,region,city,connection`);
+    if (j && j.success) {
+      const c = j.connection || {};
+      return { country: j.country, cc: j.country_code, region: j.region, city: j.city, isp: c.isp || c.org, asn: c.asn };
+    }
+  } catch { /* 查不到就算了 */ }
+  return null;
+}
+
+// 压缩成要存库 / 返回给前端的结构，字符串都做了清洗（第三方数据，前端还会再转义一次）
+function normIpInfo(r) {
+  if (!r || typeof r !== 'object') return null;
+  const o = {
+    country: cleanStr(r.country, 40), cc: cleanStr(r.cc, 2).toUpperCase(), region: cleanStr(r.region, 40), city: cleanStr(r.city, 40),
+    isp: cleanStr(r.isp, 80), asn: /^\d{1,10}$/.test(String(r.asn ?? '')) ? String(r.asn) : '',
+  };
+  return o.country || o.region || o.city || o.isp ? o : null;
+}
+
+const ipInfoReady = new WeakSet();
+
+// 返回 Map<ip, info|null>；缓存命中不访问外部，未命中的最多查 IP_LOOKUP_MAX 个
+async function getIpInfos(env, ips, t) {
+  const out = new Map();
+  const list = [...new Set(ips)].filter(isPublicIp);
+  if (!list.length || env.IPINFO_DISABLED) return out;
+  try {
+    if (!ipInfoReady.has(env.DB)) {
+      await env.DB.prepare('CREATE TABLE IF NOT EXISTS ip_info (ip TEXT PRIMARY KEY, data TEXT NOT NULL, ts INTEGER NOT NULL)').run();
+      ipInfoReady.add(env.DB);
+    }
+    const rows = await Promise.all(list.map((ip) => env.DB.prepare('SELECT data, ts FROM ip_info WHERE ip=?').bind(ip).first()));
+    const todo = [];
+    list.forEach((ip, i) => {
+      const row = rows[i];
+      let info = null;
+      if (row && row.data) { try { info = JSON.parse(row.data); } catch { /* 当作没有 */ } }
+      if (info) out.set(ip, info);
+      const fresh = row && t - row.ts < (info ? IPINFO_TTL : IPINFO_RETRY);
+      if (!fresh) todo.push(ip);
+    });
+    const lookup = env.IP_LOOKUP || fetchIpInfo;
+    await Promise.all(todo.slice(0, IP_LOOKUP_MAX).map(async (ip) => {
+      let info = null;
+      try { info = normIpInfo(await lookup(ip)); } catch { /* 当作失败 */ }
+      const old = out.get(ip);
+      if (info) out.set(ip, info);
+      // 失败时保留旧数据，把时间戳拨到“再过 IPINFO_RETRY 秒重试”
+      const data = JSON.stringify(info || old || '').replace(/^""$/, '');
+      const ts = info ? t : (old ? t - IPINFO_TTL + IPINFO_RETRY : t);
+      await env.DB.prepare('INSERT INTO ip_info (ip,data,ts) VALUES (?,?,?) ON CONFLICT(ip) DO UPDATE SET data=excluded.data, ts=excluded.ts')
+        .bind(ip, data, ts).run().catch(() => {});
+    }));
+  } catch (e) {
+    console.error('ip info', e && e.message);   // 归属地只是展示用，出错不影响节点列表
+  }
+  return out;
+}
+
+// 给前端的展示结构: carrier=运营商（中文归一）、isp=原始名称、asn、location=“国家 省 市”
+function ipView(info) {
+  if (!info) return null;
+  const parts = [];
+  for (const x of [info.country, info.region, info.city]) if (x && !parts.includes(x)) parts.push(x);
+  return { carrier: carrierOf(info.isp), isp: info.isp || '', asn: info.asn || '', cc: info.cc || '', location: parts.join(' ') };
+}
+
 // ───────────────────────── 业务逻辑 ─────────────────────────
 
 async function allocateIp(env, net) {
@@ -360,7 +499,9 @@ function publicAddrs(n, t) {
   return { ipv4, ipv6 };
 }
 
-function publicNode(n, t) {
+function publicNode(n, t, geo) {
+  const addrs = publicAddrs(n, t);
+  const view = (a) => (geo && ipView(geo.get(hostOf(a)))) || null;
   return {
     id: n.id,
     network_id: n.network_id,
@@ -381,7 +522,9 @@ function publicNode(n, t) {
     observed: !!n.observed && !(n.last_seen && t - n.last_seen < ONLINE_WINDOW),   // 仅隧道在线: agent 没有同步控制面
     nat_type: n.nat_type || '',
     stun_endpoint: n.stun_endpoint && n.stun_at && t - n.stun_at < STUN_FRESH ? n.stun_endpoint : '',
-    ...publicAddrs(n, t),
+    ...addrs,
+    ipv4_info: n.is_client ? null : view(addrs.ipv4),   // 运营商 / 归属地（查不到或未缓存时为 null）
+    ipv6_info: n.is_client ? null : view(addrs.ipv6),
     paths: parsePaths(n.paths),
     created_at: n.created_at,
   };
@@ -693,7 +836,13 @@ async function handleAdmin(request, env, url) {
     if (method === 'GET') {
       const { results } = await env.DB.prepare('SELECT * FROM nodes WHERE network_id=? ORDER BY id').bind(id).all();
       markObserved(results, t);
-      return jsonResp({ nodes: results.map((n) => publicNode(n, t)) });
+      const ips = results.flatMap((n) => {
+        if (n.is_client) return [];
+        const a = publicAddrs(n, t);
+        return [hostOf(a.ipv4), hostOf(a.ipv6)];
+      });
+      const geo = await getIpInfos(env, ips, t);
+      return jsonResp({ nodes: results.map((n) => publicNode(n, t, geo)) });
     }
     if (method === 'POST') {
       const nodeId = await createNode(env, id, await readJson(request));
@@ -768,7 +917,7 @@ export default {
     try {
       if (url.pathname.startsWith('/api/agent/')) return await handleAgent(request, env, url);
       if (url.pathname.startsWith('/api/admin/')) return await handleAdmin(request, env, url);
-      if (url.pathname === '/healthz') return textResp('ok v2.4.1\n');
+      if (url.pathname === '/healthz') return textResp('ok v2.5.0\n');
       return await env.ASSETS.fetch(request);
     } catch (e) {
       if (e instanceof HttpError) {

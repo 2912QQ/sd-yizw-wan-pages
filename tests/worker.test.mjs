@@ -22,6 +22,7 @@ function makeEnv(schema = readFileSync(new URL('../schema.sql', import.meta.url)
     DB: { prepare: (sql) => stmt(sql), batch: async (list) => { for (const s of list) await s.run(); return []; } },
     ASSETS: { fetch: async () => new Response('asset') },
     ADMIN_PASSWORD: 'pw', SESSION_SECRET: 'secret',
+    IP_LOOKUP: async () => null,   // 测试里不访问外部 IP 库
   };
 }
 
@@ -446,4 +447,70 @@ test('IPv6 优先: 对端只有 IPv6（没有 IPv4 端点）时只给 IPv6；手
   cfg = await syncWith(nodes.alice, '203.0.113.60', '2408:8207:1::5');
   assert.match(peerBlock(cfg, 'bob'), /Endpoint = bob\.example\.com:51820/);
   assert.doesNotMatch(peerBlock(cfg, 'bob'), /ep6=/);
+});
+
+test('运营商 / 归属地: 公网 IP 查询一次后走缓存；运营商归一成中文；私网/文档地址不查询；查询失败不影响列表', async () => {
+  const { env, cookie, net, nodes } = await setup();
+  const calls = [];
+  env.IP_LOOKUP = async (ip) => {
+    calls.push(ip);
+    if (ip === '1.2.3.4') return { country: '中国', cc: 'CN', region: '广东', city: '深圳', isp: 'Chinanet', asn: '4134' };
+    if (ip === '2408:8207:1::5') return { country: '中国', cc: 'CN', region: '广东', city: '广东', isp: 'CHINA UNICOM China169 Backbone', asn: 4837 };
+    return null;
+  };
+  const syncWith = (node, cf, v6) => worker.fetch(new Request('https://mesh.example/api/agent/sync', {
+    method: 'POST', headers: { Authorization: `Bearer ${node.secret}`, 'CF-Connecting-IP': cf, ...(v6 ? { 'X-Meshlink-IPv6': v6 } : {}) },
+  }), env);
+  const list = async () => (await call(env, 'GET', `/api/admin/networks/${net}/nodes`, { cookie })).json.nodes;
+  const get = async (id) => (await list()).find((n) => n.id === id);
+
+  await syncWith(nodes.alice, '1.2.3.4', '2408:8207:1::5');
+  await syncWith(nodes.bob, '203.0.113.9');            // 文档网段: 不查询
+  await syncWith(nodes.hub1, '10.1.1.1');              // 私网: 不查询
+
+  let a = await get(nodes.alice.id);
+  assert.deepEqual(a.ipv4_info, { carrier: '中国电信', isp: 'Chinanet', asn: '4134', cc: 'CN', location: '中国 广东 深圳' });
+  assert.equal(a.ipv6_info.carrier, '中国联通');
+  assert.equal(a.ipv6_info.asn, '4837');
+  assert.equal(a.ipv6_info.location, '中国 广东');       // 省市同名只显示一次
+  assert.equal((await get(nodes.bob.id)).ipv4_info, null);
+  assert.equal((await get(nodes.hub1.id)).ipv4_info, null);
+  assert.deepEqual([...calls].sort(), ['1.2.3.4', '2408:8207:1::5']);
+
+  await list(); await list();                           // 再刷新: 全部走缓存
+  assert.equal(calls.length, 2);
+
+  // STUN 端点带端口：按 IP 查询，和缓存共用
+  await call(env, 'POST', '/api/agent/report', { bearer: nodes.alice.secret, form: { stun: '1.2.3.4:40000', nat: 'cone' } });
+  a = await get(nodes.alice.id);
+  assert.equal(a.ipv4, '1.2.3.4:40000');
+  assert.equal(a.ipv4_info.carrier, '中国电信');
+  assert.equal(calls.length, 2);
+
+  // 查询失败: 列表照常返回，info 为 null；10 分钟内不重复查
+  await syncWith(nodes.bob, '5.6.7.8');
+  assert.equal((await get(nodes.bob.id)).ipv4_info, null);
+  const n1 = calls.length;
+  await list();
+  assert.equal(calls.length, n1);
+
+  // 抛异常同样不影响列表；第三方返回的 HTML 字符被清掉
+  env.IP_LOOKUP = async () => { throw new Error('boom'); };
+  await syncWith(nodes.bob, '9.9.9.9');
+  assert.equal((await list()).length, 3);
+  env.IP_LOOKUP = async () => ({ country: 'X<script>', isp: '<b>ISP</b>' });
+  await syncWith(nodes.bob, '9.9.9.8');
+  const b = await get(nodes.bob.id);
+  assert.ok(!/[<>]/.test(JSON.stringify(b.ipv4_info)));
+});
+
+test('运营商 / 归属地: IPINFO_DISABLED 时完全不查询', async () => {
+  const { env, cookie, net, nodes } = await setup();
+  let n = 0;
+  env.IP_LOOKUP = async () => { n++; return { country: '中国', isp: 'Chinanet' }; };
+  env.IPINFO_DISABLED = '1';
+  await worker.fetch(new Request('https://mesh.example/api/agent/sync', { method: 'POST', headers: { Authorization: `Bearer ${nodes.alice.secret}`, 'CF-Connecting-IP': '1.2.3.4' } }), env);
+  const r = await call(env, 'GET', `/api/admin/networks/${net}/nodes`, { cookie });
+  assert.equal(r.json.nodes.find((x) => x.id === nodes.alice.id).ipv4_info, null);
+  assert.equal(n, 0);
 });

@@ -48,3 +48,10 @@ CREATE TABLE IF NOT EXISTS settings (
   key   TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );
+
+-- 公网 IP 的运营商 / 归属地缓存（后台“公网端点”列展示用，控制面也会按需自动创建）
+CREATE TABLE IF NOT EXISTS ip_info (
+  ip   TEXT PRIMARY KEY,
+  data TEXT NOT NULL,        -- JSON；空串 = 上次查询失败
+  ts   INTEGER NOT NULL
+);
