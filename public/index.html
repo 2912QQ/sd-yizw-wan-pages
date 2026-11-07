@@ -281,7 +281,7 @@ function renderDetail() {
           <td><b>${esc(n.name)}</b>${n.is_hub ? '<span class="tag">Hub</span>' : ''}${n.is_client ? '<span class="tag">手机/电脑</span>' : ''}</td>
           <td class="mono">${esc(n.ip)}</td>
           <td>${statusBadge(n)}</td>
-          <td class="mono">${esc(n.endpoint_override || n.stun_endpoint || n.last_ip || '-')}</td>
+          <td class="mono">${epCell(n)}</td>
           <td>${n.is_client ? '-' : pathCell(n, net)}</td>
           <td class="mono">${esc(n.subnets || '-')}</td>
           <td>${n.registered && !n.is_client ? ago(n.last_seen) : '-'}</td>
@@ -356,17 +356,27 @@ function netForm(net) {
   });
 }
 
+function epCell(n) {
+  if (n.is_client) return '-';
+  const tag = (t) => `<span class="tag" style="margin:0 6px 0 0">${t}</span>`;
+  const rows = [];
+  if (n.ipv4) rows.push(`<div>${tag('v4')}${esc(n.ipv4)}</div>`);
+  if (n.ipv6) rows.push(`<div style="margin-top:3px">${tag('v6')}${esc(n.ipv6)}</div>`);
+  return rows.length ? rows.join('') : '-';
+}
+
 function nodeForm(node) {
   const edit = !!node;
   openForm(edit ? '编辑节点' : '添加节点', `
     <label>节点名称<input name="name" value="${esc(node?.name)}" required maxlength="40" placeholder="例如 office-sh"></label>
+    <label>虚拟 IP（${edit ? '修改后节点会在 1 分钟内自动重建隧道；不能与其他节点重复' : '留空则自动分配'}）<input name="ip" class="mono" value="${esc(node?.ip)}" placeholder="例如 10.88.0.10"></label>
     <label>WireGuard 监听端口<input name="listen_port" type="number" min="1" max="65535" value="${node?.listen_port || 51820}"></label>
     <label class="inline"><input type="checkbox" name="is_hub" ${node?.is_hub ? 'checked' : ''}> 这是 Hub（有公网 IP，直连失败的节点会经它中转）</label>
     <label>该节点后面的内网网段（可选，逗号分隔）<input name="subnets" value="${esc(node?.subnets)}" placeholder="192.168.1.0/24" class="mono"></label>
     <label>手动指定对外地址（可选，默认用 STUN 自动探测的公网端点）<input name="endpoint_override" value="${esc(node?.endpoint_override)}" placeholder="vpn.example.com 或 1.2.3.4:51820" class="mono"></label>`,
   async (f) => {
     const body = {
-      name: f.get('name'), listen_port: Number(f.get('listen_port')), is_hub: f.get('is_hub') === 'on',
+      name: f.get('name'), ip: (f.get('ip') || '').trim(), listen_port: Number(f.get('listen_port')), is_hub: f.get('is_hub') === 'on',
       subnets: f.get('subnets') || '', endpoint_override: f.get('endpoint_override') || '',
     };
     if (edit) { await api(`/nodes/${node.id}`, 'PUT', body); toast('已保存'); await refresh(); }
@@ -382,41 +392,53 @@ function showInstall(node) {
   if (!node || node.is_client) return;
   const o = location.origin;
   const pending = !!node.enroll_token;
+  const dockerRun = (image) => `docker run -d --name meshlink --restart unless-stopped \\\n`
+    + `  --network host --cap-add NET_ADMIN \\\n`
+    + `  -e SERVER=${o} -e TOKEN=${node.enroll_token} \\\n`
+    + `  -v /opt/meshlink:/etc/meshlink \\\n`
+    + `  ${image} bash -c 'sed -i "s/deb.debian.org/mirrors.ustc.edu.cn/g" /etc/apt/sources.list.d/*\n`
+    + `command -v curl >/dev/null || { apt-get update && apt-get install -y curl ca-certificates; }\n`
+    + `curl -fsSL --retry 5 --retry-all-errors $SERVER/agent.sh -o /tmp/a.sh && bash /tmp/a.sh container'`;
   const blocks = [];
   if (pending) {
     blocks.push({
-      title: '① 安装 — Linux (systemd)',
+      title: '安装 — Linux (systemd)',
       help: '在该节点的 Linux 机器上以 root 执行（需要 systemd；会自动安装 wireguard-tools）。令牌一次性有效。',
       cmd: `curl -fsSL ${o}/agent.sh | sudo bash -s -- install --server ${o} --token ${node.enroll_token}`,
     });
     blocks.push({
-      title: '② 安装 — Docker / iStoreOS',
-      help: 'iStoreOS / OpenWrt / 任何带 Docker 的设备，SSH 登录后粘贴执行。前提：主机内核有 WireGuard 模块（<span class="mono">lsmod | grep wireguard</span>；没有就 <span class="mono">opkg install kmod-wireguard</span>）。软件包默认走中科大镜像，境外可把 mirrors.ustc.edu.cn 换成 deb.debian.org。凭证保存在 /opt/meshlink。重装前先执行下方 Docker 卸载命令。',
-      cmd: `docker run -d --name meshlink --restart unless-stopped \\\n`
-        + `  --network host --cap-add NET_ADMIN \\\n`
-        + `  -e SERVER=${o} -e TOKEN=${node.enroll_token} \\\n`
-        + `  -v /opt/meshlink:/etc/meshlink \\\n`
-        + `  debian:bookworm-slim bash -c 'sed -i "s/deb.debian.org/mirrors.ustc.edu.cn/g" /etc/apt/sources.list.d/*\n`
-        + `command -v curl >/dev/null || { apt-get update && apt-get install -y curl ca-certificates; }\n`
-        + `curl -fsSL --retry 5 --retry-all-errors $SERVER/agent.sh -o /tmp/a.sh && bash /tmp/a.sh container'`,
+      title: '安装 — Docker / iStoreOS',
+      help: 'iStoreOS / OpenWrt / 任何带 Docker 的设备，SSH 登录后粘贴执行。前提：主机内核有 WireGuard 模块（<span class="mono">lsmod | grep wireguard</span>；没有就 <span class="mono">opkg install kmod-wireguard</span>）。软件包默认走中科大镜像，境外可把 mirrors.ustc.edu.cn 换成 deb.debian.org。凭证保存在 /opt/meshlink。iStoreOS 的防火墙（fw4）会由 agent 自动放行 meshlink 接口、转发和监听的 UDP 端口，不用再手动配置；Hub 在别的路由器后面时仍需在那台路由器上做端口转发。重装前先执行下方 Docker 卸载命令。',
+      cmd: dockerRun('debian:bookworm-slim'),
+    });
+    blocks.push({
+      title: 'Docker 拉取镜像失败 — 方法一：用加速站拉镜像',
+      help: '如果报 <span class="mono">registry-1.docker.io … Client.Timeout exceeded</span>（连不上 Docker Hub）：先执行 <span class="mono">curl -sS -o /dev/null -w "%{http_code}\\n" https://docker.m.daocloud.io/v2/</span>，返回 200 或 401 就说明加速站可用，然后用下面这条（只是镜像名加了加速站前缀）。',
+      cmd: dockerRun('docker.m.daocloud.io/library/debian:bookworm-slim'),
+    });
+    blocks.push({
+      title: 'Docker 拉取镜像失败 — 方法二：给 Docker 配置全局镜像加速',
+      help: '设备以后还要拉别的镜像时用这个（iStoreOS 的 Docker 设置页里也有“镜像加速”选项，填 https://docker.m.daocloud.io 即可）。配置好后，直接用上面“安装 — Docker / iStoreOS”那条命令。',
+      cmd: 'mkdir -p /etc/docker\ncat > /etc/docker/daemon.json <<\'EOF\'\n{"registry-mirrors":["https://docker.m.daocloud.io"]}\nEOF\n/etc/init.d/dockerd restart',
     });
   }
   blocks.push({
-    title: (pending ? '③' : '①') + ' 管理 — Linux (systemd)',
+    title: '管理 — Linux (systemd)',
     help: '节点安装后的常用命令（在节点机器上以 root 执行）。',
     cmd: '# 查看状态（含 NAT 类型、各对端直连/中转）\nmeshlink-agent status\n# 立即同步一次配置 / 单次 STUN 探测\nmeshlink-agent sync\nmeshlink-agent stun\n# 查看日志\njournalctl -u meshlink-agent -f\n# 升级 agent（控制面更新后执行一次）\ncurl -fsSL ' + o + '/agent.sh | sudo bash -s -- upgrade\n# 卸载（之后记得在后台删除该节点）\nmeshlink-agent uninstall',
   });
   blocks.push({
-    title: (pending ? '④' : '②') + ' 管理 — Docker / iStoreOS',
+    title: '管理 — Docker / iStoreOS',
     help: '节点装在 Docker 里时用这些命令。',
     cmd: '# 查看日志（装依赖、注册、运行情况）\ndocker logs -f meshlink\n# 查看状态（含 NAT 类型、各对端直连/中转）\ndocker exec meshlink meshlink-agent status\n# 单次 STUN 探测\ndocker exec meshlink meshlink-agent stun\n# 重启（同时会重新下载最新版 agent，相当于升级）\ndocker restart meshlink\n# 卸载 / 重装前清理（之后记得在后台删除该节点）\ndocker rm -f meshlink && rm -rf /opt/meshlink',
   });
+  const nums = '①②③④⑤⑥⑦⑧';
   const d = $('#dlg');
   d.innerHTML = `<div class="box">
     <h3>${pending ? '安装节点' : '节点命令'}“${esc(node.name)}”</h3>
     <p class="muted" style="margin:0">虚拟 IP: <span class="mono">${esc(node.ip)}</span>${pending ? '' : '　（节点已注册，安装令牌已失效；需要重新安装请先在列表里点“重置”）'}</p>
     ${blocks.map((x, i) => `<div style="display:grid;gap:6px">
-      <div class="row" style="align-items:center;justify-content:space-between"><b>${x.title}</b><button class="btn sm" data-copy="${i}">复制</button></div>
+      <div class="row" style="align-items:center;justify-content:space-between"><b>${nums[i]} ${x.title}</b><button class="btn sm" data-copy="${i}">复制</button></div>
       <p class="muted" style="margin:0;font-size:12.5px">${x.help}</p>
       <pre data-pre="${i}"></pre></div>`).join('')}
     <div class="row end"><button class="btn pri" data-close>完成</button></div></div>`;

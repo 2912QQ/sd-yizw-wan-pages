@@ -133,13 +133,48 @@ apply_config() {
   fi
 }
 
+# 本机出网用的公网 IPv6（只用于后台展示，不参与隧道）；没有 IPv6 或只有 ULA/链路本地时返回空
+local_ipv6() {
+  local a
+  a=$(ip -6 route get 2606:4700:4700::1111 2>/dev/null | sed -n 's/.* src \([0-9a-fA-F:]*\).*/\1/p' | head -n1)
+  case "$a" in
+    "" | ::1 | fe[89abAB]* | f[cdCD]*) return 0 ;;
+  esac
+  printf '%s' "$a"
+}
+
+# iStoreOS / OpenWrt (fw4/nftables) 默认丢弃“防火墙不认识的接口”的流量：自动放行 WireGuard 接口与监听端口。
+# 规则加在 fw4 的 input/forward 链最前面并带 meshlink-agent 备注；防火墙重载后规则会丢，下一次同步（≤1 分钟）自动补回。
+# 没有 nft 或没有 fw4 表（普通 Linux）时什么都不做。
+fw_ensure() {
+  command -v nft >/dev/null 2>&1 || return 0
+  ip link show "$IFACE" >/dev/null 2>&1 || return 0
+  nft list chain inet fw4 input >/dev/null 2>&1 || return 0
+  local port tag="meshlink-agent"
+  port=$(sed -n 's/^ListenPort[[:space:]]*=[[:space:]]*\([0-9]\{1,5\}\).*/\1/p' "/etc/wireguard/$IFACE.conf" 2>/dev/null | head -n1)
+  if ! nft list chain inet fw4 input 2>/dev/null | grep -q "$tag"; then
+    nft "insert rule inet fw4 input iifname \"$IFACE\" accept comment \"$tag\"" 2>/dev/null \
+      && log "防火墙(fw4): 已放行 $IFACE 入站"
+    [ -n "$port" ] && nft "insert rule inet fw4 input udp dport $port accept comment \"$tag\"" 2>/dev/null \
+      && log "防火墙(fw4): 已放行 UDP $port 入站"
+  fi
+  if ! nft list chain inet fw4 forward 2>/dev/null | grep -q "$tag"; then
+    nft "insert rule inet fw4 forward iifname \"$IFACE\" accept comment \"$tag\"" 2>/dev/null \
+      && nft "insert rule inet fw4 forward oifname \"$IFACE\" accept comment \"$tag\"" 2>/dev/null \
+      && log "防火墙(fw4): 已放行 $IFACE 转发"
+  fi
+  return 0
+}
+
 do_sync() {
-  local tmp new code
+  local tmp new code v6 hdr=()
   tmp=$(mktemp) && new=$(mktemp) || return 1
+  v6=$(local_ipv6)
+  [ -n "$v6" ] && hdr=(-H "X-Meshlink-IPv6: $v6")
   code=$(curl -sS --max-time 20 -o "$tmp" -w '%{http_code}' -X POST \
-    -H "Authorization: Bearer $SECRET" "$SERVER/api/agent/sync" 2>/dev/null) || code=000
+    -H "Authorization: Bearer $SECRET" ${hdr[@]+"${hdr[@]}"} "$SERVER/api/agent/sync" 2>/dev/null) || code=000
   case "$code" in
-    200) apply_config "$tmp" "$new" ;;
+    200) apply_config "$tmp" "$new"; fw_ensure ;;
     401 | 403) log "节点已被禁用、删除或重置 (HTTP $code)，关闭隧道"; iface_down ;;
     000) log "无法连接控制面，保持现有隧道，稍后重试" ;;
     *) log "控制面返回 HTTP $code，稍后重试" ;;
@@ -297,8 +332,8 @@ cmd_container() {
   : "${SERVER:?缺少环境变量 SERVER}"
   SERVER="${SERVER%/}"
   export DEBIAN_FRONTEND=noninteractive
-  if ! command -v wg-quick >/dev/null 2>&1; then
-    apt-get update && apt-get install -y --no-install-recommends wireguard-tools iproute2 iptables procps python3 curl ca-certificates hostname </dev/null \
+  if ! command -v wg-quick >/dev/null 2>&1 || ! command -v nft >/dev/null 2>&1; then
+    apt-get update && apt-get install -y --no-install-recommends wireguard-tools iproute2 iptables nftables procps python3 curl ca-certificates hostname </dev/null \
       || die "依赖安装失败（容器需要能访问 Debian 软件源）"
   fi
   if [ ! -f "$ENV_FILE" ]; then

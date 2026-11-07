@@ -22,6 +22,7 @@ CREATE TABLE IF NOT EXISTS nodes (
   listen_port       INTEGER NOT NULL DEFAULT 51820,
   enabled           INTEGER NOT NULL DEFAULT 1,
   last_ip           TEXT,
+  ipv6              TEXT,                        -- agent 上报的本机公网 IPv6（仅展示）
   last_seen         INTEGER,
   stun_endpoint     TEXT,                        -- agent 经 STUN 探测到的公网映射端点 ip:port
   stun_at           INTEGER,                     -- 上次上报 STUN 结果的时间

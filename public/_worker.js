@@ -115,6 +115,24 @@ function parseCidr(str, minBits = 16, maxBits = 29) {
   return { net: (ip & mask) >>> 0, bits, size: 2 ** (32 - bits) };
 }
 
+// 节点虚拟 IP 必须落在网络网段内，且不能是网络地址/广播地址
+function validNodeIp(net, v) {
+  const c = parseCidr(net.cidr);
+  const x = ipToInt(String(v ?? '').trim());
+  if (!c || x === null || x <= c.net || x >= c.net + c.size - 1) {
+    throw new HttpError(400, `虚拟 IP 必须在 ${net.cidr} 网段内，且不能是网络地址或广播地址`);
+  }
+  return intToIp(x);
+}
+
+// agent 上报的本机公网 IPv6：只收全局单播地址，忽略回环/链路本地/ULA；格式不对直接忽略，不影响同步
+function normIpv6(v) {
+  const s = String(v ?? '').trim().toLowerCase();
+  if (!s || s.length > 45 || !s.includes(':') || !/^[0-9a-f:]+$/.test(s)) return '';
+  if (s === '::1' || s === '::' || /^fe[89ab]/.test(s) || /^f[cd]/.test(s)) return '';
+  return s;
+}
+
 function isPrivateNet(c) {
   const ranges = [['10.0.0.0', 8], ['172.16.0.0', 12], ['192.168.0.0', 16], ['100.64.0.0', 10]];
   return ranges.some(([ip, bits]) => {
@@ -228,8 +246,9 @@ async function createNode(env, netId, body) {
   const f = parseNodeFields(body);
   if (!f.name) throw new HttpError(400, '节点名称必填');
   const token = randomToken(24);
+  const fixedIp = body.ip !== undefined && String(body.ip).trim() ? validNodeIp(net, body.ip) : '';
   for (let i = 0; i < 5; i++) {
-    const ip = await allocateIp(env, net);
+    const ip = fixedIp || await allocateIp(env, net);
     if (!ip) throw new HttpError(409, '地址池已用尽');
     try {
       const r = await env.DB.prepare(
@@ -239,6 +258,7 @@ async function createNode(env, netId, body) {
     } catch (e) {
       if (isUnique(e)) {
         if (/nodes\.name/.test(String(e.message))) throw new HttpError(409, '该网络下已有同名节点');
+        if (fixedIp) throw new HttpError(409, `虚拟 IP ${fixedIp} 已被占用`);
         continue; // IP 冲突，重新分配
       }
       throw e;
@@ -305,6 +325,18 @@ async function createClient(env, netId, body) {
 
 const isOnline = (n, t) => !!(n.enabled && n.last_seen && t - n.last_seen < ONLINE_WINDOW);
 
+// 后台“公网端点”列：IPv4 / IPv6 分开显示
+//   IPv4: 手动指定 > 新鲜的 STUN 端点 > 控制面看到的 IPv4；IPv6: 手动指定的 IPv6 > agent 上报的 > 控制面看到的 IPv6
+function publicAddrs(n, t) {
+  const ov = n.endpoint_override || '';
+  const ovV6 = ov.includes(':') && !/^[^:]+:\d+$/.test(ov);
+  const stun = n.stun_endpoint && n.stun_at && t - n.stun_at < STUN_FRESH ? n.stun_endpoint : '';
+  const seen = n.last_ip || '';
+  const ipv4 = (ovV6 ? '' : ov) || stun || (seen && !seen.includes(':') ? seen : '');
+  const ipv6 = (ovV6 ? ov : '') || n.ipv6 || (seen.includes(':') ? seen : '');
+  return { ipv4, ipv6 };
+}
+
 function publicNode(n, t) {
   return {
     id: n.id,
@@ -325,6 +357,7 @@ function publicNode(n, t) {
     online: isOnline(n, t),
     nat_type: n.nat_type || '',
     stun_endpoint: n.stun_endpoint && n.stun_at && t - n.stun_at < STUN_FRESH ? n.stun_endpoint : '',
+    ...publicAddrs(n, t),
     paths: parsePaths(n.paths),
     created_at: n.created_at,
   };
@@ -463,9 +496,19 @@ async function handleAgent(request, env, url) {
 
     const ip = request.headers.get('CF-Connecting-IP') || '';
     const t = now();
-    if (ip && (ip !== node.last_ip || t - (node.last_seen || 0) >= WRITE_THROTTLE)) {
-      await env.DB.prepare('UPDATE nodes SET last_ip=?, last_seen=? WHERE id=?').bind(ip, t, node.id).run();
+    const v6 = normIpv6(request.headers.get('X-Meshlink-IPv6'));
+    if (ip && (ip !== node.last_ip || v6 !== (node.ipv6 || '') || t - (node.last_seen || 0) >= WRITE_THROTTLE)) {
+      const upd = () => env.DB.prepare('UPDATE nodes SET last_ip=?, last_seen=?, ipv6=? WHERE id=?').bind(ip, t, v6 || null, node.id).run();
+      try {
+        await upd();
+      } catch (e) {
+        if (!/no such column:? ?ipv6|no column named ipv6/i.test(String(e && e.message))) throw e;
+        // 旧库还没有 ipv6 列：自动补上再重试（等价于执行 migrations/0003_ipv6.sql）；补不上就退回只写 IPv4
+        try { await env.DB.prepare('ALTER TABLE nodes ADD COLUMN ipv6 TEXT').run(); await upd(); }
+        catch { await env.DB.prepare('UPDATE nodes SET last_ip=?, last_seen=? WHERE id=?').bind(ip, t, node.id).run(); }
+      }
       node.last_ip = ip;
+      node.ipv6 = v6;
     }
 
     const { results: peers } = await env.DB.prepare(
@@ -612,15 +655,22 @@ async function handleAdmin(request, env, url) {
   if ((m = path.match(/^\/nodes\/(\d+)$/))) {
     const id = Number(m[1]);
     if (method === 'PUT') {
-      const f = parseNodeFields(await readJson(request));
-      const keys = Object.keys(f); // 键名全部来自 parseNodeFields 白名单
+      const b = await readJson(request);
+      const f = parseNodeFields(b);
+      if (b.ip !== undefined && String(b.ip).trim()) {
+        const cur = await env.DB.prepare('SELECT network_id FROM nodes WHERE id=?').bind(id).first();
+        if (!cur) throw new HttpError(404, '节点不存在');
+        const net = await env.DB.prepare('SELECT * FROM networks WHERE id=?').bind(cur.network_id).first();
+        f.ip = validNodeIp(net, b.ip);
+      }
+      const keys = Object.keys(f); // 键名全部来自 parseNodeFields 白名单（ip 经 validNodeIp 校验）
       if (!keys.length) throw new HttpError(400, '没有可更新的字段');
       try {
         const r = await env.DB.prepare(`UPDATE nodes SET ${keys.map((k) => k + '=?').join(', ')} WHERE id=?`)
           .bind(...keys.map((k) => f[k]), id).run();
         if (!r.meta.changes) throw new HttpError(404, '节点不存在');
       } catch (e) {
-        if (isUnique(e)) throw new HttpError(409, '该网络下已有同名节点');
+        if (isUnique(e)) throw new HttpError(409, /nodes\.name/.test(String(e.message)) ? '该网络下已有同名节点' : '该虚拟 IP 已被其他节点占用');
         throw e;
       }
       return jsonResp({ ok: true });

@@ -281,3 +281,73 @@ test('设置: 副标题可自定义、可清空，需要登录，超长被拒绝
   assert.equal((await call(env, 'PUT', '/api/admin/settings', { cookie, body: { subtitle: '' } })).json.subtitle, '');
   assert.equal((await call(env, 'PUT', '/api/admin/settings', { cookie, body: { subtitle: 'x'.repeat(101) } })).status, 400);
 });
+
+test('虚拟 IP: 创建时可指定；修改时校验网段、占用，并体现在配置里', async () => {
+  const { env, cookie, net, nodes } = await setup(); // hub1=.1 alice=.2 bob=.3
+  const mk = (body) => call(env, 'POST', `/api/admin/networks/${net}/nodes`, { cookie, body });
+  assert.equal((await mk({ name: 'c1', ip: '10.88.0.50' })).status, 201);
+  assert.equal((await mk({ name: 'c2', ip: '10.88.0.50' })).status, 409);
+  assert.equal((await mk({ name: 'c3', ip: '10.99.0.5' })).status, 400);
+  assert.equal((await mk({ name: 'c4', ip: '10.88.0.0' })).status, 400);
+  assert.equal((await mk({ name: 'c5', ip: '10.88.0.255' })).status, 400);
+  assert.equal((await mk({ name: 'c6', ip: 'abc' })).status, 400);
+  assert.equal((await mk({ name: 'c7', ip: '' })).status, 201); // 留空仍然自动分配
+  const put = (id, ip) => call(env, 'PUT', `/api/admin/nodes/${id}`, { cookie, body: { ip } });
+  assert.equal((await put(nodes.alice.id, '10.88.0.2')).status, 200); // 没改
+  assert.equal((await put(nodes.alice.id, '10.88.0.3')).status, 409); // 被 bob 占用
+  assert.equal((await put(nodes.alice.id, '10.88.1.9')).status, 400);
+  assert.equal((await put(nodes.alice.id, '10.88.0.77')).status, 200);
+  assert.equal((await put(9999, '10.88.0.78')).status, 404);
+  const own = await sync(env, nodes.alice, '203.0.113.60');
+  assert.match(own.text, /Address = 10\.88\.0\.77\/24/);
+  const peer = await sync(env, nodes.bob, '203.0.113.61');
+  assert.match(peerBlock(peer.text, 'alice'), /AllowedIPs = 10\.88\.0\.77\/32/);
+});
+
+test('公网端点: IPv4 / IPv6 分开；agent 上报的全局 IPv6 被采用，链路本地和 ULA 被忽略', async () => {
+  const { env, cookie, net, nodes } = await setup();
+  const syncWith = (node, cf, v6) => worker.fetch(new Request('https://mesh.example/api/agent/sync', {
+    method: 'POST', headers: { Authorization: `Bearer ${node.secret}`, 'CF-Connecting-IP': cf, ...(v6 ? { 'X-Meshlink-IPv6': v6 } : {}) },
+  }), env);
+  const view = async () => (await call(env, 'GET', `/api/admin/networks/${net}/nodes`, { cookie })).json.nodes.find((n) => n.id === nodes.alice.id);
+
+  assert.equal((await syncWith(nodes.alice, '203.0.113.60', '2408:8207:1::5')).status, 200);
+  let n = await view();
+  assert.equal(n.ipv4, '203.0.113.60');
+  assert.equal(n.ipv6, '2408:8207:1::5');
+
+  for (const bad of ['fe80::1', 'fd00::5', '::1', 'not-an-ip', 'x'.repeat(60)]) {
+    await syncWith(nodes.alice, '203.0.113.61', bad);
+    n = await view();
+    assert.equal(n.ipv6, '', bad);        // 无效/内网地址不展示
+    assert.equal(n.ipv4, '203.0.113.61'); // IPv4 照常更新
+  }
+
+  await syncWith(nodes.alice, '2408:1::9', ''); // 节点是经 IPv6 连上控制面的
+  n = await view();
+  assert.equal(n.ipv6, '2408:1::9');
+  assert.equal(n.ipv4, '');
+
+  // STUN 端点优先作为 IPv4 显示
+  await call(env, 'POST', '/api/agent/report', { bearer: nodes.alice.secret, form: { stun: '198.51.100.7:40000', nat: 'cone' } });
+  assert.equal((await view()).ipv4, '198.51.100.7:40000');
+});
+
+test('IPv6 列: 未迁移的旧库上 sync 照常并自动补列；迁移文件可执行', async () => {
+  const schema = readFileSync(new URL('../schema.sql', import.meta.url), 'utf8').replace(/^\s*ipv6\s.*\n/gm, '');
+  const env = makeEnv(schema);
+  env.db.exec("INSERT INTO networks (name,cidr,mode,created_at) VALUES ('lab','10.88.0.0/24','mesh',1)");
+  const secret = 'b'.repeat(64);
+  const crypto = await import('node:crypto');
+  const hash = crypto.createHash('sha256').update(secret).digest('hex');
+  env.db.exec(`INSERT INTO nodes (network_id,name,ip,public_key,secret_hash,created_at) VALUES (1,'n1','10.88.0.1','${pubKey('A')}','${hash}',1)`);
+  const r = await worker.fetch(new Request('https://mesh.example/api/agent/sync', {
+    method: 'POST', headers: { Authorization: `Bearer ${secret}`, 'CF-Connecting-IP': '203.0.113.5', 'X-Meshlink-IPv6': '2408:8207:1::5' },
+  }), env);
+  assert.equal(r.status, 200);
+  assert.equal(env.db.prepare('SELECT ipv6 FROM nodes WHERE id=1').get().ipv6, '2408:8207:1::5');
+
+  const env2 = makeEnv(schema);
+  env2.db.exec(readFileSync(new URL('../migrations/0003_ipv6.sql', import.meta.url), 'utf8'));
+  assert.ok(env2.db.prepare('PRAGMA table_info(nodes)').all().some((c) => c.name === 'ipv6'));
+});
