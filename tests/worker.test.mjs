@@ -133,7 +133,10 @@ test('report: paths 可附带往返延迟，旧格式仍然兼容', async () => 
   assert.equal((await rep(`${nodes.bob.id}:d,${nodes.hub1.id}:p`)).status, 200);     // 旧 agent 的格式
   const old = (await call(env, 'GET', `/api/admin/networks/${net}/nodes`, { cookie })).json.nodes.find((n) => n.id === nodes.alice.id);
   assert.deepEqual(old.paths, [{ peer_id: nodes.bob.id, state: 'd' }, { peer_id: nodes.hub1.id, state: 'p' }]);
-  for (const bad of ['1:d:', '1:d:abc', '1:d:123456', '1:x:5', '1:d:5:6']) assert.equal((await rep(bad)).status, 400, bad);
+  assert.equal((await rep(`${nodes.bob.id}:d:23:6,${nodes.hub1.id}:d::4`)).status, 200);   // 带 IPv6/IPv4 标记
+  const fam = (await call(env, 'GET', `/api/admin/networks/${net}/nodes`, { cookie })).json.nodes.find((n) => n.id === nodes.alice.id);
+  assert.deepEqual(fam.paths, [{ peer_id: nodes.bob.id, state: 'd', rtt: 23, family: 'v6' }, { peer_id: nodes.hub1.id, state: 'd', family: 'v4' }]);
+  for (const bad of ['1:d:', '1:d:abc', '1:d:123456', '1:x:5', '1:d:5:7', '1:d:5:6:1', '1:d::']) assert.equal((await rep(bad)).status, 400, bad);
 });
 
 test('在线: agent 没同步控制面，但在线节点报告与它有新鲜握手时显示在线（仅隧道）', async () => {

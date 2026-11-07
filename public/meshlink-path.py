@@ -672,6 +672,14 @@ class Daemon:
         except (OSError, ValueError):
             return {}
 
+    def family_of(self, pub, d):
+        """当前对端用的是 IPv6 还是 IPv4 端点: 'v6' / 'v4' / ''。"""
+        f = self.pm.endpoint_family(pub)
+        if f:
+            return f
+        ep = (d or {}).get('endpoint')
+        return '' if ep in (None, '', '(none)') else ('v6' if ep_is_v6(ep) else 'v4')
+
     def _write_status(self, t, peers, dump, labels):
         rows = []
         for p in peers:
@@ -680,8 +688,7 @@ class Daemon:
                          'hub': p['meta'].get('hub') == '1', 'state': labels.get(p['pub'], ''),
                          'hs_age': int(t - d['hs']) if d.get('hs') else None, 'nat': p['meta'].get('nat', 'unknown'),
                          'rtt': self.rtt_ms(p['pub']),
-                         'family': self.pm.endpoint_family(p['pub']) or
-                                   (('v6' if ep_is_v6(d.get('endpoint')) else 'v4') if d.get('endpoint') not in (None, '', '(none)') else '')})
+                         'family': self.family_of(p['pub'], d)})
         data = {'ts': int(t), 'nat': self.nat, 'endpoint': self.endpoint, 'peers': rows, 'modes': self.pm.modes()}
         try:
             os.makedirs(os.path.dirname(self.status_file), mode=0o700, exist_ok=True)
@@ -844,20 +851,38 @@ class Daemon:
         for pub in res['kicks']:
             self.wg.kick(pub, keep.get(pub))
 
-        self.measure_latency(t, peers, res['labels'])
-        self.last_labels = res['labels']
+        # 路径状态管理器只给“mesh 模式下的普通对端”打标签；Hub 对端、Hub 节点自己的对端、中心辐射网络里的对端
+        # 没有直连/中转之分（本来就是直连 Hub），这里按握手新鲜度补上 d / p，这样后台能看到到每个对端的状态和延迟
+        plabels = {}
+        for p in peers:
+            pub = p['pub']
+            if pub not in dump:
+                continue
+            if pub in res['labels']:
+                plabels[pub] = res['labels'][pub]
+            else:
+                hs = dump[pub].get('hs')
+                plabels[pub] = 'd' if hs and t - hs < SESSION_MAX else 'p'
+        self.measure_latency(t, peers, plabels)
+        self.last_labels = plabels
 
         def path_item(p):
-            item = '%s:%s' % (p['meta']['id'], res['labels'][p['pub']])
-            ms = self.rtt_rep.get(p['pub'])
-            return item if ms is None else '%s:%d' % (item, ms)
+            pub, label = p['pub'], plabels[p['pub']]
+            ms = self.rtt_rep.get(pub)
+            fam = {'v6': '6', 'v4': '4'}.get(self.family_of(pub, dump.get(pub))) if label == 'd' else None
+            item = '%s:%s' % (p['meta']['id'], label)
+            if ms is not None or fam:
+                item += ':%s' % ('' if ms is None else ms)
+            if fam:
+                item += ':' + fam
+            return item
         self.paths_str = ','.join(path_item(p) for p in peers
-                                  if p['pub'] in res['labels'] and p['meta'].get('id', '').isdigit())
+                                  if p['pub'] in plabels and p['meta'].get('id', '').isdigit())
         # 和哪些对端有新鲜握手（含 Hub）：上报给控制面，这样即使对端的 agent 连不上控制面，后台也知道它的隧道还活着
         self.alive_str = ','.join(sorted(
             (p['meta']['id'] for p in peers if p['meta'].get('id', '').isdigit()
              and dump.get(p['pub'], {}).get('hs') and t - dump[p['pub']]['hs'] < SESSION_MAX), key=int))
-        self._write_status(t, peers, dump, res['labels'])
+        self._write_status(t, peers, dump, plabels)
         self.maybe_report(t)
 
     def run_forever(self):
@@ -896,13 +921,14 @@ def cmd_status():
     out('NAT 类型: %s' % NAT_TEXT.get(st.get('nat'), st.get('nat')))
     out('STUN 公网端点: %s' % (st.get('endpoint') or '-'))
     out('状态更新于 %d 秒前' % max(0, int(time.time()) - st.get('ts', 0)))
-    rows = [p for p in st.get('peers', []) if not p.get('hub')]
+    rows = st.get('peers', [])
     if rows:
         out('对端路径:')
         for p in rows:
             hs = ('握手 %ds 前' % p['hs_age']) if p.get('hs_age') is not None else '尚未握手'
             fam = {'v6': 'IPv6', 'v4': 'IPv4'}.get(p.get('family'), '-')
-            out('  %-20s %-12s %-5s %-8s %s' % (p.get('name') or p['pub'][:8], STATE_TEXT.get(p.get('state'), '-'), fam,
+            out('  %-20s %-12s %-5s %-8s %s' % ((p.get('name') or p['pub'][:8]) + (' [Hub]' if p.get('hub') else ''),
+                                                 STATE_TEXT.get(p.get('state'), '-'), fam,
                                                  fmt_rtt(p.get('rtt')), hs))
     return 0
 

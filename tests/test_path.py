@@ -344,12 +344,12 @@ class DaemonTests(unittest.TestCase):
         d.tick()
         self.assertEqual((d.endpoint, d.nat), ('203.0.113.7:41000', 'cone'))
         self.assertEqual(self.reports[-1][:2], ('203.0.113.7:41000', 'cone'))
-        self.assertEqual(self.reports[-1][2], '3:p')
+        self.assertEqual(self.reports[-1][2], '1:d,3:p')
         n = len(self.reports)
         d.tick(); self.assertEqual(len(self.reports), n)           # 没变化不重复上报
         self.clock[0] += 50
         d.tick()
-        self.assertEqual(self.reports[-1][2], '3:r')                # 状态变化立即上报
+        self.assertEqual(self.reports[-1][2], '1:d,3:r')                # 状态变化立即上报
         allowed = [c for c in self.wg.calls if c[0] == 'allowed'][-1][1]
         self.assertEqual(allowed[A], [])
         self.assertEqual(allowed[HUB], ['10.88.0.1/32', '10.88.0.3/32', '192.168.7.0/24'])
@@ -631,6 +631,10 @@ class LatencyDaemonTests(unittest.TestCase):
                            stun_fn=lambda port, rebind: ([], None), clock=lambda: self.clock[0],
                            status_file=os.path.join(self.tmp, 'status.json'), ping_fn=ping)
 
+    def item(self, pid):
+        """paths_str 里某个对端的条目（'3:d:20:4' 之类）。"""
+        return next((x for x in self.d.paths_str.split(',') if x.startswith(pid + ':')), None)
+
     def tick(self, secs=0):
         self.clock[0] += secs
         self.wg.state[A]['hs'] = int(self.clock[0]) - 1      # 保持握手新鲜
@@ -638,37 +642,60 @@ class LatencyDaemonTests(unittest.TestCase):
         self.wg.state[HUB]['hs'] = int(self.clock[0]) - 5
         self.d.tick()
 
-    def test_direct_peer_reports_latency(self):
+    def test_all_peers_including_hub_report_latency(self):
         self.tick()
-        self.assertEqual(self.pings, ['10.88.0.3'])          # 只测对端虚拟 IP，Hub 不在路径表里
-        self.assertEqual(self.d.paths_str, '3:d:20')
+        self.assertEqual(sorted(self.pings), ['10.88.0.1', '10.88.0.3'])   # Hub 也测
+        self.assertEqual(self.d.paths_str, '1:d:20,3:d:20')
         with open(os.path.join(self.tmp, 'status.json')) as f:
             st = json.load(f)
-        self.assertEqual([p['rtt'] for p in st['peers'] if p['pub'] == A], [20])
-        self.assertEqual(self.reports[-1][2], '3:d:20')
+        self.assertEqual({p['name']: p['rtt'] for p in st['peers']}, {'hub 1': 20, 'office sh': 20})
+        self.assertEqual(self.reports[-1][2], '1:d:20,3:d:20')
+
+    def test_hub_node_itself_reports_all_peers(self):
+        # Hub 节点自己没有 mesh 状态机的标签，但仍然要报到各对端的状态和延迟
+        conf = CONF.replace('mode=mesh hub=0', 'mode=mesh hub=1')
+        with open(self.conf_path, 'w') as f:
+            f.write(conf)
+        self.d._conf_cache = (None, None)
+        self.tick()
+        self.assertEqual(self.d.paths_str, '1:d:20,3:d:20')
+
+    def test_ip_family_reported_for_direct_peers(self):
+        self.wg.state[A]['endpoint'] = '203.0.113.7:41000'
+        self.tick()
+        self.assertEqual(self.item('3'), '3:d:20:4')
+        self.wg.state[A]['endpoint'] = '[2408:8207:1::5]:51820'
+        self.tick()
+        self.assertEqual(self.item('3'), '3:d:20:6')
+
+    def test_family_without_latency(self):
+        self.values[0] = None
+        self.wg.state[A]['endpoint'] = '[2408:8207:1::5]:51820'
+        self.tick()
+        self.assertEqual(self.item('3'), '3:d::6')
 
     def test_measure_interval(self):
         self.tick(); self.tick(5); self.tick(5)
-        self.assertEqual(len(self.pings), 1)                  # LAT_INTERVAL 内不重复测
+        self.assertEqual(len(self.pings), 2)                  # 两个对端各测一次，LAT_INTERVAL 内不重复
         self.tick(mp.LAT_INTERVAL)
-        self.assertEqual(len(self.pings), 2)
+        self.assertEqual(len(self.pings), 4)
 
     def test_small_jitter_does_not_change_report(self):
         self.tick()
         n = len(self.reports)
         self.values[0] = 23.0                                 # 抖动在迟滞范围内
         self.tick(mp.LAT_INTERVAL)
-        self.assertEqual(self.d.paths_str, '3:d:20')
+        self.assertEqual(self.item('3'), '3:d:20')
         self.assertEqual(self.d.rtt_ms(A), 23)                # 本地状态文件仍是最新值
         self.assertEqual(len(self.reports), n)                # 不会为了抖动多上报一次
         self.values[0] = 60.0                                 # 明显变化才更新
         self.tick(mp.LAT_INTERVAL)
-        self.assertEqual(self.d.paths_str, '3:d:60')
+        self.assertEqual(self.item('3'), '3:d:60')
 
     def test_failed_ping_keeps_state_without_latency(self):
         self.values[0] = None
         self.tick()
-        self.assertEqual(self.d.paths_str, '3:d')
+        self.assertEqual(self.d.paths_str, '1:d,3:d')
         self.assertIsNone(self.d.rtt_ms(A))
 
     def test_stale_latency_expires(self):
@@ -676,33 +703,32 @@ class LatencyDaemonTests(unittest.TestCase):
         self.values[0] = None
         for _ in range(0, mp.LAT_TTL + mp.LAT_INTERVAL + 1, mp.LAT_INTERVAL):
             self.tick(mp.LAT_INTERVAL)
-        self.assertEqual(self.d.paths_str, '3:d')
+        self.assertEqual(self.d.paths_str, '1:d,3:d')
 
     def test_no_ping_while_trying(self):
         self.wg.state[A]['hs'] = 0                            # 从未握手 -> 尝试中
         self.clock[0] += 1
+        self.wg.state[HUB]['hs'] = int(self.clock[0]) - 5
         self.d.tick()
-        self.assertEqual(self.d.paths_str, '3:p')
-        self.assertEqual(self.pings, [])
+        self.assertEqual(self.item('3'), '3:p')
+        self.assertNotIn('10.88.0.3', self.pings)
 
     def test_latency_dropped_when_path_switches_to_relay(self):
         self.tick()
-        self.assertEqual(self.d.paths_str, '3:d:20')
-        self.clock[0] += 1
-        self.wg.state[HUB]['hs'] = int(self.clock[0]) - 5
+        self.assertEqual(self.item('3'), '3:d:20')
         self.wg.state[A]['hs'] = 0                            # 直连断了
         for _ in range(0, 130, 5):
             self.clock[0] += 5
             self.wg.state[HUB]['hs'] = int(self.clock[0]) - 5
             self.d.tick()
-            if self.d.paths_str.startswith('3:r'):
+            if (self.item('3') or '').startswith('3:r'):
                 break
-        self.assertTrue(self.d.paths_str.startswith('3:r'))
+        self.assertTrue((self.item('3') or '').startswith('3:r'))
         self.values[0] = 95.0                                 # 中转路径的延迟更高
         self.clock[0] += mp.LAT_INTERVAL
         self.wg.state[HUB]['hs'] = int(self.clock[0]) - 5
         self.d.tick()
-        self.assertEqual(self.d.paths_str, '3:r:95')
+        self.assertEqual(self.item('3'), '3:r:95')            # 中转状态不带 IPv6/IPv4 标记
 
 
 class AliveReportTests(unittest.TestCase):

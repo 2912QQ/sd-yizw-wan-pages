@@ -180,11 +180,11 @@ function normStun(v) {
   return `${m[1]}:${port}`;
 }
 
-// 路径状态 "id:d,id:p,id:r"；d=直连 p=尝试中 r=中转；可在状态后附带往返延迟（毫秒）如 "id:d:23"
+// 路径状态 "id:d,id:p,id:r"；d=直连 p=尝试中 r=中转；可附带往返延迟（毫秒）和 IPv6/IPv4: "id:d:23"、"id:d:23:6"、"id:d::4"
 function normPaths(v) {
   const out = [];
   for (const item of String(v ?? '').split(',').filter(Boolean).slice(0, 200)) {
-    if (!/^\d{1,10}:[dpr](?::\d{1,5})?$/.test(item)) throw new HttpError(400, 'paths 格式无效');
+    if (!/^\d{1,10}:[dpr](?::\d{1,5}(?::[46])?|::[46])?$/.test(item)) throw new HttpError(400, 'paths 格式无效');
     out.push(item);
   }
   return out.join(',');
@@ -192,8 +192,11 @@ function normPaths(v) {
 
 function parsePaths(v) {
   return String(v || '').split(',').filter(Boolean).map((x) => {
-    const [id, state, rtt] = x.split(':');
-    return rtt === undefined ? { peer_id: Number(id), state } : { peer_id: Number(id), state, rtt: Number(rtt) };
+    const [id, state, rtt, fam] = x.split(':');
+    const o = { peer_id: Number(id), state };
+    if (rtt) o.rtt = Number(rtt);
+    if (fam === '6') o.family = 'v6'; else if (fam === '4') o.family = 'v4';
+    return o;
   });
 }
 
@@ -765,7 +768,7 @@ export default {
     try {
       if (url.pathname.startsWith('/api/agent/')) return await handleAgent(request, env, url);
       if (url.pathname.startsWith('/api/admin/')) return await handleAdmin(request, env, url);
-      if (url.pathname === '/healthz') return textResp('ok v2.3\n');
+      if (url.pathname === '/healthz') return textResp('ok v2.4\n');
       return await env.ASSETS.fetch(request);
     } catch (e) {
       if (e instanceof HttpError) {

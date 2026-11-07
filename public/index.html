@@ -101,7 +101,7 @@ pre{margin:0;background:var(--code);color:var(--code-t);padding:12px;border:1px 
   <div class="wrap">
     <header class="card hero">
       <div>
-        <h1>龍哥Link 控制台 <span class="pill">v2.3</span></h1>
+        <h1>龍哥Link 控制台 <span class="pill">v2.4</span></h1>
         <p class="muted"><span id="subtitle"></span> <button class="btn sm ghost" id="editSub" title="自定义这段说明文字">✎ 编辑</button></p>
       </div>
       <button class="btn pill-btn" id="logout">退出登录</button>
@@ -239,12 +239,12 @@ function rttHtml(ms) {
   return `<span class="mono" style="color:${c}">${ms} ms</span>`;
 }
 
-// NAT 类型 + 逐个在线对端的路径（d 直连 / p 尝试中 / r 经 Hub 中转）和往返延迟
+// NAT 类型 + 逐个对端的路径（d 直连 / p 尝试中 / r 经 Hub 中转）、IPv6/IPv4 和往返延迟
+// 对端含 Hub；Hub 节点自己、中心辐射网络里也会列出到各对端的延迟
 function pathCell(n, net) {
   if (!n.registered || !n.online) return '<span class="muted">-</span>';
   const nat = n.nat_type
     ? `<span class="badge ${n.nat_type === 'symmetric' ? 'b-warn' : ''}" title="STUN 探测到的 NAT 类型">${NAT_LABEL[n.nat_type] || '未知'}</span>` : '';
-  if (net.mode === 'hub') return `${nat} <span class="muted">经 Hub</span>`;
   const byId = new Map(nodes.map((x) => [x.id, x]));
   const live = (n.paths || []).filter((p) => byId.get(p.peer_id) && byId.get(p.peer_id).online);
   const STATE = {
@@ -252,9 +252,13 @@ function pathCell(n, net) {
     p: '<b class="muted">尝试中</b>',
     r: '<b style="color:var(--warn)" title="直连打不通，流量经 Hub 转发">中转</b>',
   };
-  const rows = live.filter((p) => p.state in STATE).map((p) =>
-    `<div class="pr"><span class="muted">${esc(byId.get(p.peer_id).name)}</span>${STATE[p.state]}${p.state === 'p' ? '' : rttHtml(p.rtt)}</div>`);
-  return nat + (rows.length ? rows.join('') : '');
+  const FAM = { v6: '<span class="tag" style="margin:0" title="经 IPv6 直连">IPv6</span>', v4: '<span class="tag" style="margin:0" title="经 IPv4 直连">IPv4</span>' };
+  const rows = live.filter((p) => p.state in STATE).map((p) => {
+    const peer = byId.get(p.peer_id);
+    return `<div class="pr"><span class="muted">${esc(peer.name)}${peer.is_hub ? '（Hub）' : ''}</span>${STATE[p.state]}${p.state === 'd' && p.family ? FAM[p.family] : ''}${p.state === 'p' ? '' : rttHtml(p.rtt)}</div>`;
+  });
+  const hint = net.mode === 'hub' && !rows.length ? ' <span class="muted">经 Hub</span>' : '';
+  return nat + hint + rows.join('');
 }
 
 function renderDetail() {
