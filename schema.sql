@@ -40,3 +40,9 @@ CREATE TABLE IF NOT EXISTS login_attempts (
   ts INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_login_ip ON login_attempts(ip, ts);
+
+-- 控制台自定义文案（控制面也会按需自动创建）
+CREATE TABLE IF NOT EXISTS settings (
+  key   TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);

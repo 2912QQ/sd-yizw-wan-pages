@@ -518,6 +518,20 @@ async function handleAdmin(request, env, url) {
   const t = now();
   let m;
 
+  // 控制台自定义文案（副标题）。settings 表按需自动创建，旧库无需迁移
+  if (path === '/settings' && (method === 'GET' || method === 'PUT')) {
+    await env.DB.prepare('CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)').run();
+    if (method === 'PUT') {
+      const b = await readJson(request);
+      const subtitle = String(b.subtitle ?? '').trim();
+      if (subtitle.length > 100) throw new HttpError(400, '内容不能超过 100 个字符');
+      await env.DB.prepare('INSERT INTO settings (key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value')
+        .bind('subtitle', subtitle).run();
+    }
+    const row = await env.DB.prepare('SELECT value FROM settings WHERE key=?').bind('subtitle').first();
+    return jsonResp({ subtitle: row ? row.value : null });   // null = 还没自定义过，前端用默认文案
+  }
+
   if (path === '/networks' && method === 'GET') {
     const { results } = await env.DB.prepare(
       `SELECT w.*,

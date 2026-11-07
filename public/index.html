@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="robots" content="noindex">
-<title>MeshLink 控制台</title>
+<title>龍哥Link 控制台</title>
 <style>
 :root{color-scheme:dark;--bg:#050a14;--card:rgba(12,20,36,.92);--text:#e8eefc;--muted:#8794ad;--line:#1a2a44;--line2:#243a5e;--pri:#4d8dff;--pri-t:#fff;--ok:#34d399;--warn:#fbbf24;--bad:#f87171;--field:#08101f;--code:#070d1a;--code-t:#cfe0ff}
 *{box-sizing:border-box}
@@ -86,7 +86,7 @@ pre{margin:0;background:var(--code);color:var(--code-t);padding:12px;border:1px 
 
 <div id="login" class="center" hidden>
   <form class="card login" id="loginForm">
-    <h1>MeshLink</h1>
+    <h1>龍哥Link</h1>
     <p class="muted" style="margin:0">输入管理员密码登录控制台</p>
     <input type="password" id="pw" placeholder="管理员密码" autocomplete="current-password" required>
     <button class="btn pri" type="submit">登录</button>
@@ -98,8 +98,8 @@ pre{margin:0;background:var(--code);color:var(--code-t);padding:12px;border:1px 
   <div class="wrap">
     <header class="card hero">
       <div>
-        <h1>MeshLink 控制台 <span class="pill">v2.1</span></h1>
-        <p class="muted">WireGuard 异地组网：节点状态、虚拟 IP、手机/电脑一键接入。</p>
+        <h1>龍哥Link 控制台 <span class="pill">v2.1</span></h1>
+        <p class="muted"><span id="subtitle"></span> <button class="btn sm ghost" id="editSub" title="自定义这段说明文字">✎ 编辑</button></p>
       </div>
       <button class="btn pill-btn" id="logout">退出登录</button>
     </header>
@@ -162,8 +162,28 @@ $('#loginForm').onsubmit = async (e) => {
 };
 $('#logout').onclick = async () => { try { await api('/logout', 'POST'); } catch {} showLogin(); };
 
+const DEFAULT_SUB = 'WireGuard 异地组网：节点状态、虚拟 IP、手机/电脑一键接入。';
+let subtitle = DEFAULT_SUB;
+function renderSub() { $('#subtitle').textContent = subtitle; }
+async function loadSettings() {
+  try { const s = await api('/settings'); subtitle = s.subtitle == null ? DEFAULT_SUB : s.subtitle; } catch {}
+  renderSub();
+}
+$('#editSub').onclick = () => openForm('自定义说明文字', `
+  <label>显示在标题下方的内容（留空则不显示，最多 100 字）<input name="subtitle" maxlength="100" value="${esc(subtitle)}" placeholder="例如：龍哥的专属异地组网"></label>
+  <p class="muted" style="margin:0"><a href="#" id="resetSub">恢复默认文案</a></p>`, async (f) => {
+  const r = await api('/settings', 'PUT', { subtitle: f.get('subtitle') || '' });
+  subtitle = r.subtitle ?? ''; renderSub(); toast('已保存');
+});
+document.addEventListener('click', (e) => {
+  if (e.target.id !== 'resetSub') return;
+  e.preventDefault();
+  const i = $('#dlg input[name=subtitle]'); if (i) i.value = DEFAULT_SUB;
+});
+
 async function boot() {
   try { await loadNetworks(); } catch { return showLogin(); }
+  loadSettings();
   showApp();
   clearInterval(timer);
   timer = setInterval(() => { if (!document.hidden && !$('#dlg').open) refresh(true); }, 15000);
@@ -366,7 +386,7 @@ function showInstall(node) {
     + `  --network host --cap-add NET_ADMIN \\\n`
     + `  -e SERVER=${o} -e TOKEN=${node.enroll_token} \\\n`
     + `  -v /opt/meshlink:/etc/meshlink \\\n`
-    + `  debian:bookworm-slim bash -c 'command -v curl >/dev/null || { apt-get update && apt-get install -y curl ca-certificates; }; curl -fsSL $SERVER/agent.sh | bash -s -- container'`;
+    + `  debian:bookworm-slim bash -c 'command -v curl >/dev/null || { apt-get update && apt-get install -y curl ca-certificates; }; curl -fsSL --retry 5 --retry-all-errors $SERVER/agent.sh -o /tmp/a.sh && bash /tmp/a.sh container'`;
   const tabs = {
     linux: {
       cmd: linuxCmd,

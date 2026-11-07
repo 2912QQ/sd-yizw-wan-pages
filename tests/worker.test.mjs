@@ -269,3 +269,15 @@ test('客户端: 旧库没有 is_client 列时自动补列；换钥匙后公钥�
   // 普通节点不能被当成客户端换钥匙
   assert.equal((await call(env, 'PUT', `/api/admin/nodes/${id}/client`, { cookie, body: { public_key: pubKey('Q') } })).status, 404);
 });
+
+test('设置: 副标题可自定义、可清空，需要登录，超长被拒绝', async () => {
+  const env = makeEnv();
+  assert.equal((await call(env, 'GET', '/api/admin/settings')).status, 401);
+  const login = await call(env, 'POST', '/api/admin/login', { body: { password: 'pw' } });
+  const cookie = login.headers.get('set-cookie').split(';')[0];
+  assert.equal((await call(env, 'GET', '/api/admin/settings', { cookie })).json.subtitle, null);
+  assert.equal((await call(env, 'PUT', '/api/admin/settings', { cookie, body: { subtitle: '  龍哥的专属组网 ' } })).json.subtitle, '龍哥的专属组网');
+  assert.equal((await call(env, 'GET', '/api/admin/settings', { cookie })).json.subtitle, '龍哥的专属组网');
+  assert.equal((await call(env, 'PUT', '/api/admin/settings', { cookie, body: { subtitle: '' } })).json.subtitle, '');
+  assert.equal((await call(env, 'PUT', '/api/admin/settings', { cookie, body: { subtitle: 'x'.repeat(101) } })).status, 400);
+});
