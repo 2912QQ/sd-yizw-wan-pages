@@ -386,7 +386,9 @@ function showInstall(node) {
     + `  --network host --cap-add NET_ADMIN \\\n`
     + `  -e SERVER=${o} -e TOKEN=${node.enroll_token} \\\n`
     + `  -v /opt/meshlink:/etc/meshlink \\\n`
-    + `  debian:bookworm-slim bash -c 'command -v curl >/dev/null || { apt-get update && apt-get install -y curl ca-certificates; }; curl -fsSL --retry 5 --retry-all-errors $SERVER/agent.sh -o /tmp/a.sh && bash /tmp/a.sh container'`;
+    + `  debian:bookworm-slim bash -c 'sed -i "s/deb.debian.org/mirrors.ustc.edu.cn/g" /etc/apt/sources.list.d/*\n`
+    + `command -v curl >/dev/null || { apt-get update && apt-get install -y curl ca-certificates; }\n`
+    + `curl -fsSL --retry 5 --retry-all-errors $SERVER/agent.sh -o /tmp/a.sh && bash /tmp/a.sh container'`;
   const tabs = {
     linux: {
       cmd: linuxCmd,
@@ -394,7 +396,7 @@ function showInstall(node) {
     },
     docker: {
       cmd: dockerCmd,
-      help: '适用于 iStoreOS / OpenWrt / 任何带 Docker 的设备：通过 SSH 登录设备后粘贴执行。前提：主机内核已有 WireGuard 模块（执行 <span class="mono">lsmod | grep wireguard</span> 能看到；没有就先 <span class="mono">opkg update &amp;&amp; opkg install kmod-wireguard</span>）。令牌一次性有效，凭证保存在 <span class="mono">/opt/meshlink</span>（可改成其他持久化目录）。重新安装前请先 <span class="mono">docker rm -f meshlink &amp;&amp; rm -rf /opt/meshlink</span>。',
+      help: '适用于 iStoreOS / OpenWrt / 任何带 Docker 的设备：通过 SSH 登录设备后粘贴执行。前提：主机内核已有 WireGuard 模块（执行 <span class="mono">lsmod | grep wireguard</span> 能看到；没有就先 <span class="mono">opkg update &amp;&amp; opkg install kmod-wireguard</span>）。令牌一次性有效，凭证保存在 <span class="mono">/opt/meshlink</span>（可改成其他持久化目录）。软件包默认走中科大镜像（国内更快；境外可把命令里的 mirrors.ustc.edu.cn 换成 deb.debian.org）。重新安装前请先 <span class="mono">docker rm -f meshlink &amp;&amp; rm -rf /opt/meshlink</span>。',
     },
   };
   let cur = 'linux';
