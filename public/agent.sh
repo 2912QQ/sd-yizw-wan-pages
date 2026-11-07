@@ -102,6 +102,7 @@ iface_down() {
   if ip link show "$IFACE" >/dev/null 2>&1; then
     wg-quick down "$IFACE" >/dev/null 2>&1 && log "接口 $IFACE 已关闭"
   fi
+  bypass_sync
 }
 
 apply_config() {
@@ -197,9 +198,31 @@ fw_ensure() {
   return 0
 }
 
+# 出口节点（AllowedIPs 含 0.0.0.0/0）开启后，本机所有流量（包括访问控制面）都会进隧道。
+# 为了出口节点离线时 agent 仍能连上控制面自愈，给控制面域名解析出的 IPv4 加“走主路由表”的策略路由（pref 90）。
+# 没有出口节点 / 接口没起来时，这些规则会被清掉。
+BYPASS_PREF=90
+bypass_sync() {
+  local conf="/etc/wireguard/$IFACE.conf" host ips="" old a
+  old=$(ip -4 rule show 2>/dev/null | awk -v p="$BYPASS_PREF:" '$1==p && $2=="from" && $3=="all" && $4=="to" { print $5 }' | tr '\n' ' ')
+  if [ -f "$conf" ] && grep -qE '^AllowedIPs.*0\.0\.0\.0/0' "$conf" && ip link show "$IFACE" >/dev/null 2>&1; then
+    host=${SERVER:-}; host=${host#*://}; host=${host%%/*}; host=${host%%:*}
+    if printf '%s' "$host" | grep -qE '^[0-9]+(\.[0-9]+){3}$'; then ips=$host
+    else ips=$(getent ahostsv4 "$host" 2>/dev/null | awk '{ print $1 }' | sort -u | tr '\n' ' '); fi
+    [ -n "$ips" ] || return 0     # 解析不出来就保持现有规则
+  fi
+  for a in $ips; do
+    case " $old " in *" $a "*) ;; *) ip rule add pref "$BYPASS_PREF" to "$a" lookup main 2>/dev/null ;; esac
+  done
+  for a in $old; do
+    case " $ips " in *" $a "*) ;; *) ip rule del pref "$BYPASS_PREF" to "$a" lookup main 2>/dev/null ;; esac
+  done
+}
+
 do_sync() {
   local tmp new code v6 hdr=()
   tmp=$(mktemp) && new=$(mktemp) || return 1
+  bypass_sync
   v6=$(local_ipv6)
   [ -n "$v6" ] && hdr=(-H "X-Meshlink-IPv6: $v6")
   # 装了路径管理器才声明: 控制面据此决定双方都有 IPv6 时是否先走 IPv6（没有它就没法在 IPv6 不通时改回 IPv4）
@@ -207,7 +230,7 @@ do_sync() {
   code=$(curl -sS --max-time 20 -o "$tmp" -w '%{http_code}' -X POST \
     -H "Authorization: Bearer $SECRET" ${hdr[@]+"${hdr[@]}"} "$SERVER/api/agent/sync" 2>/dev/null) || code=000
   case "$code" in
-    200) apply_config "$tmp" "$new"; fw_ensure ;;
+    200) apply_config "$tmp" "$new"; fw_ensure; bypass_sync ;;
     401 | 403) log "节点已被禁用、删除或重置 (HTTP $code)，关闭隧道"; iface_down ;;
     000) log "无法连接控制面，保持现有隧道，稍后重试" ;;
     *) log "控制面返回 HTTP $code，稍后重试" ;;

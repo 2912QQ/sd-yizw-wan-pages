@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="robots" content="noindex">
-<title>龍哥Link 控制台</title>
+<title>龍哥 SD-WAN 控制台</title>
 <style>
 :root{color-scheme:dark;--bg:#050a14;--card:rgba(12,20,36,.92);--text:#e8eefc;--muted:#8794ad;--line:#1a2a44;--line2:#243a5e;--pri:#4d8dff;--pri-t:#fff;--ok:#34d399;--warn:#fbbf24;--bad:#f87171;--field:#08101f;--code:#070d1a;--code-t:#cfe0ff}
 *{box-sizing:border-box}
@@ -116,7 +116,7 @@ pre{margin:0;background:var(--code);color:var(--code-t);padding:12px;border:1px 
 
 <div id="login" class="center" hidden>
   <form class="card login" id="loginForm">
-    <h1>龍哥Link</h1>
+    <h1>龍哥 SD-WAN</h1>
     <p class="muted" style="margin:0">输入管理员密码登录控制台</p>
     <input type="password" id="pw" placeholder="管理员密码" autocomplete="current-password" required>
     <button class="btn pri" type="submit">登录</button>
@@ -128,7 +128,7 @@ pre{margin:0;background:var(--code);color:var(--code-t);padding:12px;border:1px 
   <div class="wrap">
     <header class="card hero">
       <div>
-        <h1>龍哥Link 控制台 <span class="pill">v2.5.0</span></h1>
+        <h1>龍哥 SD-WAN 控制台 <span class="pill">v1.0.6</span></h1>
         <p class="muted"><span id="subtitle"></span> <button class="btn sm ghost" id="editSub" title="自定义这段说明文字">✎ 编辑</button></p>
       </div>
       <button class="btn pill-btn" id="logout">退出登录</button>
@@ -320,6 +320,7 @@ function renderDetail() {
       <div class="actions">
         <button class="btn sm" data-a="addNode">＋ 添加节点</button>
         <button class="btn sm" data-a="addClient">＋ 添加手机/电脑</button>
+        <button class="btn sm" data-a="upgrade" title="控制面更新后，节点上的 agent 需要升级一次才有新功能（如出口节点）">升级命令</button>
         <button class="btn sm" data-a="allOn" ${nodes.length && nodes.every((n) => n.enabled) ? 'disabled' : ''} title="启用本网络的全部节点和手机/电脑">全部启用</button>
         <button class="btn sm" data-a="allOff" ${nodes.some((n) => n.enabled) ? '' : 'disabled'} title="停用本网络的全部节点和手机/电脑">全部停用</button>
         <button class="btn sm" data-a="editNet">编辑网络</button>
@@ -337,6 +338,19 @@ function renderDetail() {
       ${nodes.length ? `<div class="nodes">${nodes.map((n) => nodeCard(n, net)).join('')}</div>`
         : '<div class="empty">还没有节点，点击“添加节点”开始组网</div>'}
     </div>`;
+}
+
+// 出口节点标记：被别人选作出口的节点显示“出口节点”；使用出口的节点显示“出口 → 名称”（出口离线时提示已回退本地出网）
+function exitTag(n) {
+  if (n.is_client) return '';
+  if (n.exit_via) {
+    const ex = nodes.find((x) => x.id === n.exit_via);
+    if (!ex) return '';
+    const live = ex.enabled && ex.online;
+    return `<span class="tag" title="${live ? '该节点的全部外网流量经出口节点出去' : '出口节点当前离线/停用，已自动回退为本地出网'}">出口 → ${esc(ex.name)}${live ? '' : '（离线，本地出网）'}</span>`;
+  }
+  const users = nodes.filter((x) => x.exit_via === n.id);
+  return users.length ? `<span class="tag" title="使用它出网的节点：${esc(users.map((x) => x.name).join('、'))}">出口节点 · ${users.length}</span>` : '';
 }
 
 function nodeCard(n, net) {
@@ -357,7 +371,7 @@ function nodeCard(n, net) {
   return `<article class="node ${st} ${n.enabled ? '' : 'off'}" data-id="${n.id}">
     <div class="nh">
       <div class="nid">
-        <div class="nname"><b>${esc(n.name)}</b>${n.is_hub ? '<span class="tag">Hub</span>' : ''}${n.is_client ? '<span class="tag">手机/电脑</span>' : ''}</div>
+        <div class="nname"><b>${esc(n.name)}</b>${n.is_hub ? '<span class="tag">Hub</span>' : ''}${n.is_client ? '<span class="tag">手机/电脑</span>' : ''}${exitTag(n)}</div>
         <span class="mono nip">${esc(n.ip)}</span>
         ${statusBadge(n)}
       </div>
@@ -378,6 +392,7 @@ $('#detail').onclick = async (e) => {
   try {
     if (a === 'addNode') nodeForm();
     else if (a === 'addClient') clientForm();
+    else if (a === 'upgrade') showUpgrade();
     else if (a === 'regen') await regenClient(node);
     else if (a === 'editNet') netForm(net);
     else if (a === 'delNet') {
@@ -457,6 +472,23 @@ function epCell(n) {
   return rows.length ? rows.join('') : '-';
 }
 
+// 编辑节点时选“出口节点”：只列本网络里的普通节点（中心辐射网络只能选 Hub）；已被别人用作出口的节点不能再选别的出口
+function exitField(node) {
+  if (!node || node.is_client) return '';
+  const net = networks.find((x) => x.id === curId);
+  const usedBy = nodes.filter((x) => x.exit_via === node.id);
+  if (usedBy.length) {
+    return `<div class="muted" style="font-size:12px;margin-top:8px">此节点正被 ${esc(usedBy.map((x) => x.name).join('、'))} 用作出口节点（会自动开启转发和 NAT），所以不能再选择别的出口。</div>`;
+  }
+  const hubOnly = net && net.mode === 'hub';
+  const cands = nodes.filter((x) => !x.is_client && x.id !== node.id && !x.exit_via && (!hubOnly || x.is_hub));
+  const opts = ['<option value="0">不使用（从本机网络直接出网）</option>']
+    .concat(cands.map((x) => `<option value="${x.id}" ${x.id === node.exit_via ? 'selected' : ''}>${esc(x.name)}（${esc(x.ip)}）${x.online ? '' : ' · 离线'}</option>`));
+  return `<label>出口节点（可选：该节点的全部外网流量经它出去，对外 IP 变成出口节点的公网 IP${hubOnly ? '；中心辐射网络只能选 Hub' : ''}）
+      <select name="exit_via">${opts.join('')}</select></label>
+    <div class="muted" style="font-size:12px">出口节点离线时会自动回退为本地出网；仅 IPv4。出口节点需要能转发（Linux 需 iptables，iStoreOS 需放行转发）。<b>使用方和出口节点的 agent 都要先升级</b>：<a href="#" data-upgrade style="color:var(--pri)">查看升级命令</a></div>`;
+}
+
 function nodeForm(node) {
   const edit = !!node;
   openForm(edit ? '编辑节点' : '添加节点', `
@@ -465,12 +497,13 @@ function nodeForm(node) {
     <label>WireGuard 监听端口<input name="listen_port" type="number" min="1" max="65535" value="${node?.listen_port || 51820}"></label>
     <label class="inline"><input type="checkbox" name="is_hub" ${node?.is_hub ? 'checked' : ''}> 这是 Hub（有公网 IP，直连失败的节点会经它中转）</label>
     <label>该节点后面的内网网段（可选，逗号分隔）<input name="subnets" value="${esc(node?.subnets)}" placeholder="192.168.1.0/24" class="mono"></label>
-    <label>手动指定对外地址（可选，默认用 STUN 自动探测的公网端点）<input name="endpoint_override" value="${esc(node?.endpoint_override)}" placeholder="vpn.example.com 或 1.2.3.4:51820" class="mono"></label>`,
+    <label>手动指定对外地址（可选，默认用 STUN 自动探测的公网端点）<input name="endpoint_override" value="${esc(node?.endpoint_override)}" placeholder="vpn.example.com 或 1.2.3.4:51820" class="mono"></label>${exitField(node)}`,
   async (f) => {
     const body = {
       name: f.get('name'), ip: (f.get('ip') || '').trim(), listen_port: Number(f.get('listen_port')), is_hub: f.get('is_hub') === 'on',
       subnets: f.get('subnets') || '', endpoint_override: f.get('endpoint_override') || '',
     };
+    if (edit && f.has('exit_via')) body.exit_via = Number(f.get('exit_via') || 0);
     if (edit) { await api(`/nodes/${node.id}`, 'PUT', body); toast('已保存'); await refresh(); }
     else {
       const id = (await api(`/networks/${curId}/nodes`, 'POST', body)).id;
@@ -478,6 +511,48 @@ function nodeForm(node) {
       showInstall(nodes.find((n) => n.id === id));
     }
   }, edit ? '保存' : '创建');
+  const upg = $('#dlg').querySelector('[data-upgrade]');
+  if (upg) upg.onclick = (e) => { e.preventDefault(); showUpgrade(); };   // 会替换当前对话框；未保存的修改需重新填写
+}
+
+// 升级 agent 的命令（和节点无关，只带本控制面地址）：控制面更新后，每台节点执行一次，新功能（如出口节点）才会生效
+function showUpgrade() {
+  const o = location.origin;
+  const blocks = [
+    {
+      title: '升级 — Linux (systemd)',
+      help: '在每台节点机器上以 root 执行一次。会更新 agent 和路径管理器并重启服务；隧道可能中断几秒。',
+      cmd: `curl -fsSL ${o}/agent.sh | sudo bash -s -- upgrade`,
+    },
+    {
+      title: '升级 — Docker / iStoreOS',
+      help: '重启容器会重新下载最新版 agent，相当于升级。',
+      cmd: 'docker restart meshlink',
+    },
+    {
+      title: '确认出口是否生效（在使用出口的节点上执行）',
+      help: '设置出口节点后等约 1 分钟同步，再执行；输出应是出口节点所在网络的公网 IP。Docker 节点把命令放到 <span class="mono">docker exec meshlink</span> 后面执行。',
+      cmd: 'curl -4 -s --max-time 8 https://ifconfig.me; echo\nmeshlink-agent status',
+    },
+  ];
+  const nums = '①②③④⑤';
+  const d = $('#dlg');
+  d.innerHTML = `<div class="box">
+    <h3>升级节点 agent</h3>
+    <p class="muted" style="margin:0">控制面更新后，使用方节点和出口节点都要各升级一次，“出口节点”等新功能才会生效（旧版 agent 不会建立出口路由 / NAT）。</p>
+    ${blocks.map((x, i) => `<div style="display:grid;gap:6px">
+      <div class="row" style="align-items:center;justify-content:space-between"><b>${nums[i]} ${x.title}</b><button class="btn sm" data-copy="${i}">复制</button></div>
+      <p class="muted" style="margin:0;font-size:12.5px">${x.help}</p>
+      <pre data-pre="${i}"></pre></div>`).join('')}
+    <div class="row end"><button class="btn pri" data-close>完成</button></div></div>`;
+  blocks.forEach((x, i) => { d.querySelector(`[data-pre="${i}"]`).textContent = x.cmd; });
+  d.querySelectorAll('[data-copy]').forEach((btn) => {
+    btn.onclick = async () => {
+      try { await navigator.clipboard.writeText(blocks[Number(btn.dataset.copy)].cmd); toast('已复制'); } catch { toast('请手动选中复制'); }
+    };
+  });
+  d.querySelector('[data-close]').onclick = () => d.close();
+  if (!d.open) d.showModal();
 }
 
 function showInstall(node) {

@@ -202,6 +202,18 @@ class StateTests(unittest.TestCase):
         r2 = pm.tick(1052, SELF, peers(), dump(1052), 'cone')
         self.assertFalse(r2['newly_relayed'])                       # 只通知一次
 
+    def test_exit_route_stays_on_exit_peer_when_relayed(self):
+        # 出口节点直连不通时，0.0.0.0/0 不能挂到 Hub（否则出口 IP 变成 Hub 的）；其余地址照常挪到 Hub
+        pm = mp.PathManager()
+        pl = peers()
+        pl[1]['allowed'] = ['10.88.0.3/32', '0.0.0.0/0']
+        pm.tick(1000, SELF, pl, dump(1000), 'cone')
+        r = pm.tick(1000 + mp.GRACE + 6, SELF, pl, dump(1046), 'cone')
+        self.assertEqual(r['labels'][A], 'r')
+        self.assertEqual(r['desired'][A], ['0.0.0.0/0'])
+        self.assertEqual(r['desired'][HUB], ['10.88.0.1/32', '10.88.0.3/32'])
+        self.assertNotIn('0.0.0.0/0', r['desired'][HUB])
+
     def test_symmetric_nat_shortens_grace(self):
         pm = mp.PathManager()
         pm.tick(1000, SELF, peers(nat='symmetric'), dump(1000), 'cone')

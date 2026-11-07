@@ -227,6 +227,11 @@ function parseNodeFields(b) {
     o.listen_port = p;
   }
   if (b.enabled !== undefined) o.enabled = b.enabled ? 1 : 0;
+  if (b.exit_via !== undefined) {
+    const x = Number(b.exit_via || 0);
+    if (!Number.isInteger(x) || x < 0) throw new HttpError(400, '出口节点无效');
+    o.exit_via = x;
+  }
   return o;
 }
 
@@ -397,6 +402,27 @@ async function allocateIp(env, net) {
   return null;
 }
 
+// ───────────────────────── 出口节点（exit node）─────────────────────────
+// 节点的 exit_via = 它使用的出口节点 ID（0 = 不使用，照常从本地出网）。被别人选作出口的节点自动开启转发 + NAT。
+// 使用方：出口节点那个 peer 的 AllowedIPs 加上 0.0.0.0/0（wg-quick 会自动做策略路由，隧道自己的 UDP 不会套娃）。
+// 出口节点离线 / 被停用时不下发 0.0.0.0/0（放行本地出网），避免出口挂了以后使用方连控制面都连不上、无法自愈。
+async function checkExitVia(env, id, exitId) {
+  // 旧库没有 exit_via 列：自动补上（等价于执行 migrations/0006_exit_via.sql）
+  try { await env.DB.prepare('SELECT exit_via FROM nodes LIMIT 1').first(); }
+  catch { await env.DB.prepare('ALTER TABLE nodes ADD COLUMN exit_via INTEGER NOT NULL DEFAULT 0').run().catch(() => {}); }
+  const cur = await env.DB.prepare('SELECT n.*, w.mode AS net_mode FROM nodes n JOIN networks w ON w.id=n.network_id WHERE n.id=?').bind(id).first();
+  if (!cur) throw new HttpError(404, '节点不存在');
+  if (!exitId) return;
+  if (cur.is_client) throw new HttpError(400, '手机/电脑客户端暂不支持选择出口节点');
+  if (exitId === id) throw new HttpError(400, '不能选择自己作为出口节点');
+  const ex = await env.DB.prepare('SELECT * FROM nodes WHERE id=?').bind(exitId).first();
+  if (!ex || ex.network_id !== cur.network_id || ex.is_client) throw new HttpError(400, '出口节点必须是本网络里的普通节点');
+  if (cur.net_mode === 'hub' && !ex.is_hub) throw new HttpError(400, '中心辐射网络里，出口节点必须是 Hub（普通节点之间没有直接的隧道）');
+  if (ex.exit_via) throw new HttpError(400, `“${ex.name}”自己也在使用出口节点，不能再被选作出口（避免出口链/环路）`);
+  const used = await env.DB.prepare('SELECT 1 FROM nodes WHERE exit_via=? LIMIT 1').bind(id).first();
+  if (used) throw new HttpError(400, '该节点正被其他节点用作出口，不能同时再使用别的出口节点');
+}
+
 async function createNode(env, netId, body) {
   const net = await env.DB.prepare('SELECT * FROM networks WHERE id=?').bind(netId).first();
   if (!net) throw new HttpError(404, '网络不存在');
@@ -522,6 +548,7 @@ function publicNode(n, t, geo) {
     is_hub: !!n.is_hub,
     is_client: !!n.is_client,
     subnets: n.subnets || '',
+    exit_via: n.exit_via || 0,
     endpoint_override: n.endpoint_override || '',
     listen_port: n.listen_port,
     enabled: !!n.enabled,
@@ -596,10 +623,17 @@ function buildConfig(self, net, allPeers, t, opts = {}) {
     `MTU = ${WG_MTU}`,
     'PrivateKey = __PRIVATE_KEY__',
   ];
-  if (self.is_hub || self.subnets) {
+  // 出口节点：有人选了我当出口 → 开转发，并把来自虚拟网段、从别的网卡出去的流量做 NAT（否则外网的回包找不到路）
+  const isExit = !self.is_client && !self.exit_via && allPeers.some((p) => !p.is_client && p.exit_via === self.id);
+  // 我使用的出口节点：必须在线（离线就不走，避免全部流量黑洞、连控制面都连不上）
+  const exitPeer = self.exit_via && !self.is_client && !isExit
+    ? allPeers.find((p) => p.id === self.exit_via && !p.is_client && isOnline(p, t)) : null;
+  if (self.is_hub || self.subnets || isExit) {
     L.push(
-      'PostUp = sysctl -w net.ipv4.ip_forward=1 >/dev/null || true; iptables -I FORWARD -i %i -j ACCEPT || true; iptables -I FORWARD -o %i -j ACCEPT || true; ' + MSS_UP,
-      'PostDown = iptables -D FORWARD -i %i -j ACCEPT || true; iptables -D FORWARD -o %i -j ACCEPT || true; ' + MSS_DOWN
+      'PostUp = sysctl -w net.ipv4.ip_forward=1 >/dev/null || true; iptables -I FORWARD -i %i -j ACCEPT || true; iptables -I FORWARD -o %i -j ACCEPT || true; '
+        + (isExit ? `iptables -t nat -I POSTROUTING -s ${netCidr} ! -o %i -j MASQUERADE || true; ` : '') + MSS_UP,
+      'PostDown = iptables -D FORWARD -i %i -j ACCEPT || true; iptables -D FORWARD -o %i -j ACCEPT || true; '
+        + (isExit ? `iptables -t nat -D POSTROUTING -s ${netCidr} ! -o %i -j MASQUERADE || true; ` : '') + MSS_DOWN
     );
   }
 
@@ -618,6 +652,7 @@ function buildConfig(self, net, allPeers, t, opts = {}) {
     const allowed = [`${p.ip}/32`];
     if (p.subnets) allowed.push(...p.subnets.split(','));
     if (p === primaryHub && !iAmPrimary) allowed.push(...clientIps);
+    if (exitPeer && p === exitPeer) allowed.push('0.0.0.0/0');   // 全部外网流量经这个出口节点
     if (spoke && p === primaryHub) {
       // 中心辐射模式: 其余节点（及其内网网段）的流量经主 Hub 中转
       allowed.push(netCidr);
@@ -913,6 +948,7 @@ async function handleAdmin(request, env, url) {
         const net = await env.DB.prepare('SELECT * FROM networks WHERE id=?').bind(cur.network_id).first();
         f.ip = validNodeIp(net, b.ip);
       }
+      if (f.exit_via !== undefined) await checkExitVia(env, id, f.exit_via);
       const keys = Object.keys(f); // 键名全部来自 parseNodeFields 白名单（ip 经 validNodeIp 校验）
       if (!keys.length) throw new HttpError(400, '没有可更新的字段');
       try {
@@ -927,6 +963,7 @@ async function handleAdmin(request, env, url) {
     }
     if (method === 'DELETE') {
       await env.DB.prepare('DELETE FROM nodes WHERE id=?').bind(id).run();
+      await env.DB.prepare('UPDATE nodes SET exit_via=0 WHERE exit_via=?').bind(id).run().catch(() => {});  // 还在用它当出口的节点恢复直连出网
       return jsonResp({ ok: true });
     }
   }
@@ -955,7 +992,7 @@ export default {
     try {
       if (url.pathname.startsWith('/api/agent/')) return await handleAgent(request, env, url);
       if (url.pathname.startsWith('/api/admin/')) return await handleAdmin(request, env, url);
-      if (url.pathname === '/healthz') return textResp('ok v2.5.0\n');
+      if (url.pathname === '/healthz') return textResp('ok v1.0.6\n');
       return await env.ASSETS.fetch(request);
     } catch (e) {
       if (e instanceof HttpError) {

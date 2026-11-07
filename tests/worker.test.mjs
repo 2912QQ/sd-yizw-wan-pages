@@ -615,3 +615,105 @@ test('客户端: Hub 有 IPv6 时额外给出 IPv6 端点，并告诉界面浏�
   assert.match(j.endpoint_v6, /^\[2408:8207:1::1\]:\d+$/);
   assert.equal(j.viewer_v6, true);
 });
+
+
+// ───────── 出口节点 ─────────
+test('出口节点: 选了出口的节点 AllowedIPs 加 0.0.0.0/0，出口节点自动开转发 + NAT', async () => {
+  const { env, cookie, nodes } = await setup();
+  for (const [n, ip] of [['hub1', '198.51.100.1'], ['alice', '203.0.113.60'], ['bob', '203.0.113.50']]) await sync(env, nodes[n], ip);
+
+  // 没人选出口时：没有 0.0.0.0/0，也没有 NAT
+  let cfg = (await sync(env, nodes.alice, '203.0.113.60')).text;
+  assert.doesNotMatch(cfg, /0\.0\.0\.0\/0/);
+  assert.doesNotMatch((await sync(env, nodes.bob, '203.0.113.50')).text, /MASQUERADE/);
+
+  const put = (id, body) => call(env, 'PUT', `/api/admin/nodes/${id}`, { cookie, body });
+  assert.equal((await put(nodes.alice.id, { exit_via: nodes.bob.id })).status, 200);
+
+  cfg = (await sync(env, nodes.alice, '203.0.113.60')).text;
+  assert.match(peerBlock(cfg, 'bob'), /AllowedIPs = 10\.88\.0\.3\/32, 192\.168\.7\.0\/24, 0\.0\.0\.0\/0/);
+  assert.doesNotMatch(peerBlock(cfg, 'hub1'), /0\.0\.0\.0\/0/);          // 只有出口那个对端带默认路由
+  assert.doesNotMatch(cfg, /MASQUERADE/);                                  // 使用方不做 NAT
+
+  const bobCfg = (await sync(env, nodes.bob, '203.0.113.50')).text;       // 出口节点: 开转发 + 对虚拟网段做 NAT，自己不带 0.0.0.0/0
+  assert.match(bobCfg, /^PostUp = .*ip_forward=1.*-t nat -I POSTROUTING -s 10\.88\.0\.0\/24 ! -o %i -j MASQUERADE/m);
+  assert.match(bobCfg, /^PostDown = .*-t nat -D POSTROUTING -s 10\.88\.0\.0\/24 ! -o %i -j MASQUERADE/m);
+  assert.doesNotMatch(bobCfg, /0\.0\.0\.0\/0/);
+
+  // 取消后恢复
+  assert.equal((await put(nodes.alice.id, { exit_via: 0 })).status, 200);
+  assert.doesNotMatch((await sync(env, nodes.alice, '203.0.113.60')).text, /0\.0\.0\.0\/0/);
+  assert.doesNotMatch((await sync(env, nodes.bob, '203.0.113.50')).text, /MASQUERADE/);
+});
+
+test('出口节点: 出口离线 / 停用时不下发 0.0.0.0/0（避免使用方失联），恢复后自动回来', async () => {
+  const { env, cookie, nodes } = await setup();
+  for (const [n, ip] of [['hub1', '198.51.100.1'], ['alice', '203.0.113.60'], ['bob', '203.0.113.50']]) await sync(env, nodes[n], ip);
+  await call(env, 'PUT', `/api/admin/nodes/${nodes.alice.id}`, { cookie, body: { exit_via: nodes.bob.id } });
+  assert.match((await sync(env, nodes.alice, '203.0.113.60')).text, /0\.0\.0\.0\/0/);
+
+  env.db.exec(`UPDATE nodes SET last_seen = last_seen - 100000 WHERE id=${nodes.bob.id}`);   // bob 久未同步 = 离线
+  assert.doesNotMatch((await sync(env, nodes.alice, '203.0.113.60')).text, /0\.0\.0\.0\/0/);
+
+  await sync(env, nodes.bob, '203.0.113.50');                                                // bob 回来了
+  assert.match((await sync(env, nodes.alice, '203.0.113.60')).text, /0\.0\.0\.0\/0/);
+
+  await call(env, 'PUT', `/api/admin/nodes/${nodes.bob.id}`, { cookie, body: { enabled: false } });
+  assert.doesNotMatch((await sync(env, nodes.alice, '203.0.113.60')).text, /0\.0\.0\.0\/0/);
+});
+
+test('出口节点: 校验（自己 / 跨网络 / 出口链 / 中心辐射只能选 Hub / 客户端）', async () => {
+  const { env, cookie, net, nodes } = await setup();
+  const put = (id, body) => call(env, 'PUT', `/api/admin/nodes/${id}`, { cookie, body });
+  assert.equal((await put(nodes.alice.id, { exit_via: nodes.alice.id })).status, 400);
+  assert.equal((await put(nodes.alice.id, { exit_via: 99999 })).status, 400);
+  assert.equal((await put(nodes.alice.id, { exit_via: -1 })).status, 400);
+  assert.equal((await put(nodes.alice.id, { exit_via: 'x' })).status, 400);
+
+  assert.equal((await put(nodes.alice.id, { exit_via: nodes.bob.id })).status, 200);
+  assert.equal((await put(nodes.bob.id, { exit_via: nodes.hub1.id })).status, 400);        // bob 正被 alice 用作出口，不能再用别的出口
+  assert.equal((await put(nodes.hub1.id, { exit_via: nodes.alice.id })).status, 400);      // alice 自己在用出口，不能当别人的出口（防链/环）
+
+  // 另一个网络的节点不能当出口
+  const net2 = (await call(env, 'POST', '/api/admin/networks', { cookie, body: { name: 'other', cidr: '10.99.0.0/24' } })).json.id;
+  const other = (await call(env, 'POST', `/api/admin/networks/${net2}/nodes`, { cookie, body: { name: 'x1' } })).json.id;
+  assert.equal((await put(nodes.hub1.id, { exit_via: other })).status, 400);
+
+  // 手机/电脑客户端不能选，也不能当出口
+  await sync(env, nodes.hub1, '198.51.100.1');
+  const c = await addClient(env, cookie, net, 'phone', 'P');
+  assert.equal(c.status, 201, c.text);
+  assert.equal((await put(c.json.id, { exit_via: nodes.hub1.id })).status, 400);
+  assert.equal((await put(nodes.hub1.id, { exit_via: c.json.id })).status, 400);
+
+  // 删除出口节点后，使用方的出口自动清掉
+  assert.equal((await call(env, 'DELETE', `/api/admin/nodes/${nodes.bob.id}`, { cookie })).status, 200);
+  const list = (await call(env, 'GET', `/api/admin/networks/${net}/nodes`, { cookie })).json.nodes;
+  assert.equal(list.find((n) => n.id === nodes.alice.id).exit_via, 0);
+});
+
+test('出口节点: 中心辐射网络里出口必须是 Hub，且 0.0.0.0/0 挂在该 Hub 上', async () => {
+  const { env, cookie, nodes } = await setup('hub');
+  for (const [n, ip] of [['hub1', '198.51.100.1'], ['alice', '203.0.113.60'], ['bob', '203.0.113.50']]) await sync(env, nodes[n], ip);
+  const put = (id, body) => call(env, 'PUT', `/api/admin/nodes/${id}`, { cookie, body });
+  assert.equal((await put(nodes.alice.id, { exit_via: nodes.bob.id })).status, 400);
+  assert.equal((await put(nodes.alice.id, { exit_via: nodes.hub1.id })).status, 200);
+  const cfg = (await sync(env, nodes.alice, '203.0.113.60')).text;
+  assert.match(peerBlock(cfg, 'hub1'), /AllowedIPs = .*0\.0\.0\.0\/0/);
+  assert.match(peerBlock(cfg, 'hub1'), /AllowedIPs = .*10\.88\.0\.0\/24/);
+  assert.match((await sync(env, nodes.hub1, '198.51.100.1')).text, /MASQUERADE/);
+});
+
+test('出口节点: 旧库没有 exit_via 列时自动补列', async () => {
+  const schema = readFileSync(new URL('../schema.sql', import.meta.url), 'utf8').replace(/^\s*exit_via .*\n/m, '');
+  assert.doesNotMatch(schema, /exit_via/);
+  const env = makeEnv(schema);
+  const login = await call(env, 'POST', '/api/admin/login', { body: { password: 'pw' } });
+  const cookie = login.headers.get('set-cookie').split(';')[0];
+  const net = (await call(env, 'POST', '/api/admin/networks', { cookie, body: { name: 'lab', cidr: '10.88.0.0/24' } })).json.id;
+  const a = (await call(env, 'POST', `/api/admin/networks/${net}/nodes`, { cookie, body: { name: 'a' } })).json.id;
+  const b = (await call(env, 'POST', `/api/admin/networks/${net}/nodes`, { cookie, body: { name: 'b' } })).json.id;
+  assert.equal((await call(env, 'PUT', `/api/admin/nodes/${a}`, { cookie, body: { exit_via: b } })).status, 200);
+  const list = (await call(env, 'GET', `/api/admin/networks/${net}/nodes`, { cookie })).json.nodes;
+  assert.equal(list.find((n) => n.id === a).exit_via, b);
+});

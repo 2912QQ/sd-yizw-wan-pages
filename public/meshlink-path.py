@@ -592,8 +592,12 @@ class PathManager:
         for p in peers:
             s = self.st.get(p['pub'])
             if s and s['mode'] == 'relay' and p['meta'].get('hub') != '1':
-                desired[p['pub']] = []                  # 一个 IP 只能属于一个对端: 从直连对端摘掉，挂到 Hub 上
-                moved += p['allowed']
+                # 一个 IP 只能属于一个对端: 从直连对端摘掉，挂到 Hub 上。
+                # 例外: 出口路由 0.0.0.0/0 留在出口节点上——挂到 Hub 的话，出口流量会从 Hub 自己的网络漏出去（出口 IP 变成 Hub 的）；
+                # 留着则是“出口直连暂时不通 → 外网流量暂停”，直连恢复后自动继续，不会泄漏。
+                keep = [a for a in p['allowed'] if a == '0.0.0.0/0']
+                desired[p['pub']] = keep
+                moved += [a for a in p['allowed'] if a != '0.0.0.0/0']
         if moved:
             desired[relay_hub['pub']] = list(dict.fromkeys(relay_hub['allowed'] + moved))
         return res

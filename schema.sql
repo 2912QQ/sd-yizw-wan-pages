@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS nodes (
   stun_at           INTEGER,                     -- 上次上报 STUN 结果的时间
   nat_type          TEXT,                        -- public | cone | symmetric | unknown
   alive             TEXT,                        -- agent 上报的“有新鲜握手的对端 ID”，用来判断 agent 没同步但隧道还活着的节点
+  exit_via          INTEGER NOT NULL DEFAULT 0,    -- 使用的出口节点 ID（0 = 不使用；全部外网流量经该节点出去）
   paths             TEXT,                        -- 到各对端的路径状态 "对端ID:d|p|r,..."（d 直连 / p 尝试中 / r 中转）
   created_at        INTEGER NOT NULL,
   UNIQUE (network_id, ip),
