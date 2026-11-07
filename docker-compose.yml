@@ -13,6 +13,10 @@ services:
     network_mode: host          # WireGuard 接口建在主机网络里
     cap_add:
       - NET_ADMIN               # 创建/配置 WireGuard 接口
+    # 容器里解析不了控制面域名时（日志里反复出现 “Could not resolve host”，常见于 pages.dev 被本地 DNS 污染）：
+    # 优先给控制面绑定自己的域名；临时办法是在这里把域名固定到一个能访问的 IP（在能解析的机器上 nslookup 得到）：
+    # extra_hosts:
+    #   - "你的域名:IP地址"
     environment:
       SERVER: "https://你的域名"
       TOKEN: "粘贴节点令牌"

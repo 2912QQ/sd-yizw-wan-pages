@@ -1,6 +1,6 @@
 {
   "name": "meshlink",
-  "version": "2.4.0",
+  "version": "2.4.1",
   "private": true,
   "type": "module",
   "description": "WireGuard 异地组网控制面，运行在 Cloudflare Pages + D1 上",

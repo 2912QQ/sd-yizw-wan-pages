@@ -101,7 +101,7 @@ pre{margin:0;background:var(--code);color:var(--code-t);padding:12px;border:1px 
   <div class="wrap">
     <header class="card hero">
       <div>
-        <h1>龍哥Link 控制台 <span class="pill">v2.4</span></h1>
+        <h1>龍哥Link 控制台 <span class="pill">v2.4.1</span></h1>
         <p class="muted"><span id="subtitle"></span> <button class="btn sm ghost" id="editSub" title="自定义这段说明文字">✎ 编辑</button></p>
       </div>
       <button class="btn pill-btn" id="logout">退出登录</button>
@@ -243,6 +243,8 @@ function rttHtml(ms) {
 // 对端含 Hub；Hub 节点自己、中心辐射网络里也会列出到各对端的延迟
 function pathCell(n, net) {
   if (!n.registered || !n.online) return '<span class="muted">-</span>';
+  // 仅隧道在线: agent 没有同步控制面，它上报的 NAT / 路径是旧数据，不显示（其他节点那一行里能看到到它的路径和延迟）
+  if (n.observed) return '<span class="muted" title="agent 连不上控制面，NAT 和路径数据已过期；到它的直连/延迟见其他节点的行">agent 未同步</span>';
   const nat = n.nat_type
     ? `<span class="badge ${n.nat_type === 'symmetric' ? 'b-warn' : ''}" title="STUN 探测到的 NAT 类型">${NAT_LABEL[n.nat_type] || '未知'}</span>` : '';
   const byId = new Map(nodes.map((x) => [x.id, x]));
