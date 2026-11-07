@@ -351,3 +351,54 @@ test('IPv6 列: 未迁移的旧库上 sync 照常并自动补列；迁移文件�
   env2.db.exec(readFileSync(new URL('../migrations/0003_ipv6.sql', import.meta.url), 'utf8'));
   assert.ok(env2.db.prepare('PRAGMA table_info(nodes)').all().some((c) => c.name === 'ipv6'));
 });
+
+test('IPv6 优先: 双方都有 IPv6 且 agent 带路径管理器标记时 Endpoint 给 IPv6，并附 ep6/ep4；否则保持 IPv4', async () => {
+  const { env, nodes } = await setup();
+  const syncWith = (node, cf, v6, path = true) => worker.fetch(new Request('https://mesh.example/api/agent/sync', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${node.secret}`, 'CF-Connecting-IP': cf, ...(v6 ? { 'X-Meshlink-IPv6': v6 } : {}), ...(path ? { 'X-Meshlink-Path': '1' } : {}) },
+  }), env).then(async (r) => ({ status: r.status, text: await r.text() }));
+
+  await syncWith(nodes.bob, '203.0.113.50', '2408:8207:2::9');
+  await call(env, 'POST', '/api/agent/report', { bearer: nodes.bob.secret, form: { stun: '203.0.113.50:41000', nat: 'cone' } });
+
+  // alice 有 IPv6 + 路径管理器: 对 bob 先走 IPv6，IPv4(STUN 端点) 作为兜底写进元信息
+  let r = await syncWith(nodes.alice, '203.0.113.60', '2408:8207:1::5');
+  let bob = peerBlock(r.text, 'bob');
+  assert.match(bob, /Endpoint = \[2408:8207:2::9\]:51820/);
+  assert.match(bob, /# meshlink peer id=\d+ hub=0 online=1 nat=cone ep6=\[2408:8207:2::9\]:51820 ep4=203\.0\.113\.50:41000/);
+  assert.doesNotMatch(bob, /Endpoint = 203/);
+
+  // 没带路径管理器标记（旧 agent / 没有 python3）: 保持 IPv4，不会因为 IPv6 被拦而断连
+  r = await syncWith(nodes.alice, '203.0.113.60', '2408:8207:1::5', false);
+  bob = peerBlock(r.text, 'bob');
+  assert.match(bob, /Endpoint = 203\.0\.113\.50:41000/);
+  assert.doesNotMatch(bob, /ep6=/);
+
+  // 本机没有 IPv6: 用 IPv4
+  r = await syncWith(nodes.alice, '203.0.113.60', '');
+  bob = peerBlock(r.text, 'bob');
+  assert.match(bob, /Endpoint = 203\.0\.113\.50:41000/);
+
+  // 对端没有 IPv6: 用 IPv4
+  await syncWith(nodes.bob, '203.0.113.50', '');
+  r = await syncWith(nodes.alice, '203.0.113.60', '2408:8207:1::5');
+  assert.match(peerBlock(r.text, 'bob'), /Endpoint = 203\.0\.113\.50:41000/);
+});
+
+test('IPv6 优先: 对端只有 IPv6（没有 IPv4 端点）时只给 IPv6；手动指定的对外地址永远优先', async () => {
+  const { env, cookie, net, nodes } = await setup();
+  const syncWith = (node, cf, v6) => worker.fetch(new Request('https://mesh.example/api/agent/sync', {
+    method: 'POST', headers: { Authorization: `Bearer ${node.secret}`, 'CF-Connecting-IP': cf, 'X-Meshlink-Path': '1', ...(v6 ? { 'X-Meshlink-IPv6': v6 } : {}) },
+  }), env).then((r) => r.text());
+
+  await syncWith(nodes.bob, '2408:8207:2::9', '');            // bob 经 IPv6 连上控制面，没有 IPv4 信息
+  let cfg = await syncWith(nodes.alice, '203.0.113.60', '2408:8207:1::5');
+  assert.match(peerBlock(cfg, 'bob'), /Endpoint = \[2408:8207:2::9\]:51820/);
+  assert.doesNotMatch(peerBlock(cfg, 'bob'), /ep4=/);          // 没有 IPv4 可兜底，不写 ep6/ep4
+
+  await call(env, 'PUT', `/api/admin/nodes/${nodes.bob.id}`, { cookie, body: { endpoint_override: 'bob.example.com' } });
+  cfg = await syncWith(nodes.alice, '203.0.113.60', '2408:8207:1::5');
+  assert.match(peerBlock(cfg, 'bob'), /Endpoint = bob\.example\.com:51820/);
+  assert.doesNotMatch(peerBlock(cfg, 'bob'), /ep6=/);
+});

@@ -5,7 +5,8 @@
 做三件事:
   1. STUN 端口探测: 用 WireGuard 的监听端口向 STUN 服务器探测 NAT 后面真实的公网 ip:port，
      并判断 NAT 类型（public / cone / symmetric），上报控制面；其他节点用这个端点来直连。
-  2. 直连优先: 每个对端默认直连；握手长时间不成功（或已建立的会话长时间收不到包）才判定直连失败。
+  2. 直连优先: 每个对端默认直连；双方都有公网 IPv6 时先走 IPv6，握手不成功再改试 IPv4，
+     两个都不通（或已建立的会话长时间收不到包）才判定直连失败。
   3. 自动回落: 直连失败的对端，把它的 AllowedIPs 挪到 Hub 上，流量经 Hub 中转；之后定期探测，
      直连恢复后自动切回。
 
@@ -41,6 +42,7 @@ STUN_MIN_GAP = 60      # 秒；两次 STUN 探测的最小间隔
 STUN_BUDGET = 4.0      # 秒；一次探测的总时限（期间 WireGuard 端口被短暂让出）
 GRACE = 40             # 秒；新对端握手不成功多久判定直连失败
 GRACE_SYM = 15         # 秒；任一端是对称 NAT 时缩短等待（基本不可能打通）
+GRACE_V6 = 20          # 秒；IPv6 没有 NAT，打不通多半是防火墙拦了入站，缩短等待尽快改试 IPv4
 RX_STALL = 75          # 秒；已建立的会话超过这么久没有收到任何包判定失效（正常至少每 25 秒一个保活包）
 SESSION_MAX = 180      # 秒；WireGuard 会话最长有效期，握手超过这个时间视为没有会话
 PROBE_EVERY = 45       # 秒；中转状态下每隔多久主动触发一次直连握手探测
@@ -231,6 +233,25 @@ def parse_conf(text):
     return selfm, [p for p in peers if p['pub']]
 
 
+def ep_is_v6(ep):
+    """'[2408::1]:51820' -> True；'1.2.3.4:51820' -> False"""
+    return bool(ep) and (ep.startswith('[') or ep.count(':') > 1)
+
+
+def grace_for(ep, sym):
+    """握手宽限期: IPv6 端点没有 NAT 问题，用较短的；IPv4 遇到对称 NAT 更短（基本打不通）。"""
+    if ep and ep_is_v6(ep):
+        return GRACE_V6
+    return GRACE_SYM if sym else GRACE
+
+
+def candidates(peer):
+    """控制面在双方都有 IPv6 时才会下发 ep6 / ep4，返回按优先级排好的 [IPv6 端点, IPv4 端点]；否则 []（沿用 Endpoint 行）。"""
+    m = peer['meta']
+    c = [m.get('ep6'), m.get('ep4')]
+    return c if all(c) else []
+
+
 def parse_dump(text):
     """解析 `wg show <if> dump`。返回 (dev, {pub: {endpoint, allowed, hs, rx, tx}}) 或 None。"""
     lines = [l for l in text.split('\n') if l.strip()]
@@ -273,6 +294,9 @@ class Wg:
             args += ['peer', pub, 'allowed-ips', ','.join(lst)]
         return self._run(args) is not None
 
+    def set_endpoint(self, pub, endpoint):
+        return self._run(['set', self.iface, 'peer', pub, 'endpoint', endpoint]) is not None
+
     def set_listen_port(self, port):
         return self._run(['set', self.iface, 'listen-port', str(port)]) is not None
 
@@ -295,7 +319,8 @@ class PathManager:
     relay → direct: 进入中转之后出现了新的握手，且握手足够新，连续 RECOVER_OK 次检查成立。"""
 
     def __init__(self):
-        self.st = {}
+        self.st = {}      # 直连/中转状态（仅非 Hub 对端、mesh 模式）
+        self.fam = {}     # IPv6 / IPv4 端点选择状态（所有拿到 ep6+ep4 的对端，含 Hub）
 
     def preload(self, modes, t):
         for pub, mode in (modes or {}).items():
@@ -309,16 +334,25 @@ class PathManager:
 
     def tick(self, t, selfm, peers, dump, self_nat):
         desired = {p['pub']: list(p['allowed']) for p in peers}
-        res = {'desired': desired, 'kicks': [], 'labels': {}, 'newly_relayed': False, 'events': [], 'relay_hub': None}
+        res = {'desired': desired, 'kicks': [], 'labels': {}, 'newly_relayed': False, 'events': [], 'relay_hub': None,
+               'endpoints': {}}
         hubs = [p for p in peers if p['meta'].get('hub') == '1']
         managed = selfm.get('mode', 'mesh') == 'mesh' and selfm.get('hub') != '1' and bool(hubs)
         if not managed:
             self.st.clear()
-            return res
 
         live = {p['pub'] for p in peers}
         for k in [k for k in self.st if k not in live]:
             del self.st[k]
+        for k in [k for k in self.fam if k not in live]:
+            del self.fam[k]
+
+        # 先做 IPv6 / IPv4 端点选择（对所有对端生效，不管是不是 mesh 模式、是不是 Hub）
+        for p in peers:
+            sym = 'symmetric' in (self_nat, p['meta'].get('nat'))
+            self._family(t, p, dump.get(p['pub']), sym, managed and p['meta'].get('hub') != '1', res)
+        if not managed:
+            return res
 
         def age(pub):
             hs = dump.get(pub, {}).get('hs', 0)
@@ -346,7 +380,8 @@ class PathManager:
                 s['rx'], s['rx_t'] = d['rx'], t
 
             a = age(pub)
-            have = a is not None and a < SESSION_MAX
+            ff = self.fam.get(pub)
+            have = a is not None and a < SESSION_MAX and (ff is None or d['hs'] >= ff['sw'])   # 切换 IPv6/IPv4 之前的旧握手不算
             online = p['meta'].get('online', '1') == '1'
             sym = 'symmetric' in (self_nat, p['meta'].get('nat'))
 
@@ -354,12 +389,16 @@ class PathManager:
                 if not online:
                     s['since'] = s['rx_t'] = t          # 对端离线不算直连失败，上线后重新计时
                 else:
+                    f = self.fam.get(pub)
+                    cur_ep = f['cands'][f['fi']] if f else None
                     if have:
                         dead = t - s['rx_t'] > RX_STALL
                         why = '已建立的会话 %ds 没有收到任何包' % RX_STALL
                     else:
-                        dead = t - s['since'] > (GRACE_SYM if sym else GRACE)
-                        why = '握手超时%s' % ('（存在对称 NAT）' if sym else '')
+                        dead = t - s['since'] > grace_for(cur_ep, sym)
+                        why = '握手超时%s' % ('（存在对称 NAT）' if sym and not (cur_ep and ep_is_v6(cur_ep)) else '')
+                    if f and f['tried'] < len(f['cands']):
+                        dead = False                    # IPv6 / IPv4 还有没试过的，先别走中转
                     if dead and hub_ok:
                         s.update(mode='relay', relay_at=t, ok=0, probe_at=t)
                         res['newly_relayed'] = True
@@ -369,9 +408,18 @@ class PathManager:
                 s['ok'] = s['ok'] + 1 if (fresh and t - s['relay_at'] >= RELAY_MIN_DWELL) else 0
                 if s['ok'] >= RECOVER_OK:
                     s.update(mode='direct', since=t, rx_t=t, ok=0)
+                    f = self.fam.get(pub)
+                    if f:
+                        f.update(tried=1, since=t, rx_t=t, sw=0)
                     res['events'].append('对端 %s 直连已恢复，切回直连' % (p['name'] or pub[:8]))
                 elif t - s['probe_at'] >= PROBE_EVERY:
                     s['probe_at'] = t
+                    f = self.fam.get(pub)
+                    if f:                               # 每次探测换一族，IPv6 / IPv4 轮流试
+                        f['fi'] = (f['fi'] + 1) % len(f['cands'])
+                        f['sw'] = t
+                        f['applied'] = f['cands'][f['fi']]
+                        res['endpoints'][pub] = f['applied']
                     res['kicks'].append(pub)
 
             res['labels'][pub] = 'r' if s['mode'] == 'relay' else ('d' if have else 'p')
@@ -385,6 +433,78 @@ class PathManager:
         if moved:
             desired[relay_hub['pub']] = list(dict.fromkeys(relay_hub['allowed'] + moved))
         return res
+
+    # ---- IPv6 优先、IPv4 兜底 ----
+    def _family(self, t, p, d, sym, relayable, res):
+        """双方都有 IPv6 时先试 IPv6（没有 NAT，通了就是真直连），一个握手宽限期内没通再改试 IPv4。
+        两个都试过仍不通，relayable 的对端交给下面的中转逻辑；Hub / 非 mesh 模式没有中转可退，就持续轮换。
+        返回 True 表示该对端启用了族选择。"""
+        pub = p['pub']
+        cands = candidates(p)
+        if not cands or d is None:
+            self.fam.pop(pub, None)
+            return False
+        hs = d['hs']
+        age = (t - hs) if hs else None
+        live = age is not None and age < SESSION_MAX
+        f = self.fam.get(pub)
+        if f is None or f['cands'] != cands:
+            f = {'cands': cands, 'fi': 0, 'tried': 1, 'since': t, 'rx': None, 'rx_t': t, 'sw': 0, 'applied': None}
+            cur = d.get('endpoint') or ''
+            if live and cur not in ('', '(none)'):
+                # agent 重启或端点信息刷新时已经有会话在跑: 沿用它正在用的那一族，不去打断
+                for i, c in enumerate(cands):
+                    if ep_is_v6(c) == ep_is_v6(cur):
+                        f['fi'], f['applied'] = i, c
+                        break
+            self.fam[pub] = f
+        if f['rx'] is None or d['rx'] != f['rx']:
+            f['rx'], f['rx_t'] = d['rx'], t
+        s = self.st.get(pub)
+        in_relay = bool(s and s['mode'] == 'relay')
+        online = p['meta'].get('online', '1') == '1'
+        have = live and hs >= f['sw']          # 必须是切换端点之后才出现的握手，才算这一族通了
+        cur_ep = cands[f['fi']]
+        name = p['name'] or pub[:8]
+
+        dead = False
+        if not online:
+            f['since'] = f['rx_t'] = t
+        elif have:
+            if t - f['rx_t'] > RX_STALL:
+                dead = True
+            else:
+                f['tried'] = 1
+        else:
+            dead = t - f['since'] > grace_for(cur_ep, sym)
+        if dead and not in_relay and (not relayable or f['tried'] < len(cands)):
+            nxt = (f['fi'] + 1) % len(cands)
+            res['events'].append('对端 %s 经 %s 直连失败，改试 %s' % (
+                name, 'IPv6' if ep_is_v6(cur_ep) else 'IPv4', 'IPv6' if ep_is_v6(cands[nxt]) else 'IPv4'))
+            f.update(fi=nxt, tried=f['tried'] + 1, since=t, rx_t=t, sw=t)
+            if s:
+                s['since'] = s['rx_t'] = t
+            cur_ep = cands[nxt]
+            have = False
+
+        need = f['applied'] != cur_ep
+        if not need and not have:
+            seen = d.get('endpoint') or ''
+            # wg syncconf 会把端点重置成配置文件里的地址: 没有可用会话时，族对不上就重新设回来
+            need = seen not in ('', '(none)') and ep_is_v6(seen) != ep_is_v6(cur_ep)
+        if need:
+            res['endpoints'][pub] = cur_ep
+            f['applied'] = cur_ep
+        return True
+
+    def fam_unapply(self, pub):
+        """wg set endpoint 失败时调用: 下一次 tick 重试。"""
+        if pub in self.fam:
+            self.fam[pub]['applied'] = None
+
+    def endpoint_family(self, pub):
+        f = self.fam.get(pub)
+        return None if not f else ('v6' if ep_is_v6(f['cands'][f['fi']]) else 'v4')
 
     def modes(self):
         return {k: v['mode'] for k, v in self.st.items()}
@@ -451,7 +571,9 @@ class Daemon:
             d = dump.get(p['pub'], {})
             rows.append({'id': p['meta'].get('id'), 'name': p['name'], 'pub': p['pub'],
                          'hub': p['meta'].get('hub') == '1', 'state': labels.get(p['pub'], ''),
-                         'hs_age': int(t - d['hs']) if d.get('hs') else None, 'nat': p['meta'].get('nat', 'unknown')})
+                         'hs_age': int(t - d['hs']) if d.get('hs') else None, 'nat': p['meta'].get('nat', 'unknown'),
+                         'family': self.pm.endpoint_family(p['pub']) or
+                                   (('v6' if ep_is_v6(d.get('endpoint')) else 'v4') if d.get('endpoint') not in (None, '', '(none)') else '')})
         data = {'ts': int(t), 'nat': self.nat, 'endpoint': self.endpoint, 'peers': rows, 'modes': self.pm.modes()}
         try:
             os.makedirs(os.path.dirname(self.status_file), mode=0o700, exist_ok=True)
@@ -560,6 +682,14 @@ class Daemon:
                    if pub in dump and set(lst) != set(dump[pub]['allowed'])}
         if changes:
             self.wg.set_allowed(changes)
+        for pub, ep in res['endpoints'].items():
+            if pub not in dump:
+                continue
+            if self.wg.set_endpoint(pub, ep):
+                log('对端 %s 端点切到 %s（%s）' % (next((p['name'] for p in peers if p['pub'] == pub), pub[:8]), ep,
+                                                  'IPv6' if ep_is_v6(ep) else 'IPv4'))
+            else:
+                self.pm.fam_unapply(pub)
         keep = {p['pub']: p['keepalive'] for p in peers}
         for pub in res['kicks']:
             self.wg.kick(pub, keep.get(pub))
@@ -611,7 +741,8 @@ def cmd_status():
         out('对端路径:')
         for p in rows:
             hs = ('握手 %ds 前' % p['hs_age']) if p.get('hs_age') is not None else '尚未握手'
-            out('  %-20s %-12s %s' % (p.get('name') or p['pub'][:8], STATE_TEXT.get(p.get('state'), '-'), hs))
+            fam = {'v6': 'IPv6', 'v4': 'IPv4'}.get(p.get('family'), '-')
+            out('  %-20s %-12s %-5s %s' % (p.get('name') or p['pub'][:8], STATE_TEXT.get(p.get('state'), '-'), fam, hs))
     return 0
 
 

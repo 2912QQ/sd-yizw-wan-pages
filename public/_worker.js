@@ -363,6 +363,17 @@ function publicNode(n, t) {
   };
 }
 
+// 节点的公网 IPv6：agent 上报的 > 控制面看到的（节点是经 IPv6 连上来的）
+const v6Of = (n) => n.ipv6 || (n.last_ip && n.last_ip.includes(':') ? n.last_ip : '');
+
+// 分别给出一个节点的 IPv4 / IPv6 端点（不含手动指定；IPv6 没有 NAT，端口就是监听端口）
+function endpointsFor(p, t) {
+  const stun = p.stun_endpoint && p.stun_at && t - p.stun_at < STUN_FRESH ? p.stun_endpoint : '';
+  const seen4 = p.last_ip && !p.last_ip.includes(':') ? `${p.last_ip}:${p.listen_port}` : '';
+  const v6 = v6Of(p);
+  return { v4: stun || seen4, v6: v6 ? `[${v6}]:${p.listen_port}` : '' };
+}
+
 // 对端地址优先级: 手动指定 > agent 用 STUN 探测到的真实映射端点 > CF 看到的公网 IP + 监听端口
 function endpointFor(p, t) {
   if (p.endpoint_override) {
@@ -377,9 +388,12 @@ function endpointFor(p, t) {
 //
 // 注释行 "# meshlink self/peer ..." 是给 agent 的路径管理器看的元信息（wg 会忽略注释）:
 //   self: mode=mesh|hub  hub=0|1  override=0|1
-//   peer: id  hub  online  nat
+//   peer: id  hub  online  nat  [ep6 ep4]
 // mesh 模式下 agent 会先尝试直连，打不通时把该对端经由 Hub 中转。
-function buildConfig(self, net, allPeers, t) {
+// IPv6 优先: 请求方带 X-Meshlink-Path（agent 装了路径管理器）且双方都有公网 IPv6 时，Endpoint 先给 IPv6，
+// 同时在 peer 元信息里附上 ep6/ep4，路径管理器在 IPv6 握手不成功时改试 IPv4，两个都不通才走 Hub 中转。
+// 没有路径管理器的 agent 保持原来的 IPv4 优先，不会因为 IPv6 被拦而断连。
+function buildConfig(self, net, allPeers, t, opts = {}) {
   let peers = allPeers;
   const c = parseCidr(net.cidr);
   const netCidr = `${intToIp(c.net)}/${c.bits}`;
@@ -408,6 +422,7 @@ function buildConfig(self, net, allPeers, t) {
   // 客户端（手机/电脑）只连主 Hub：主 Hub 把它们当对端；其余节点把它们的地址挂在主 Hub 上
   const iAmPrimary = !!self.is_hub && hubs.every((h) => h.id > self.id);
   const clientIps = clients.map((c) => `${c.ip}/32`);
+  const selfHasV6 = !!v6Of(self);
 
   for (const p of list) {
     const allowed = [`${p.ip}/32`];
@@ -418,12 +433,20 @@ function buildConfig(self, net, allPeers, t) {
       allowed.push(netCidr);
       for (const o of peers) if (o !== p && o.subnets) allowed.push(...o.subnets.split(','));
     }
+    let ep = endpointFor(p, t);
+    let dual = '';
+    if (opts.pathCapable && selfHasV6 && !p.endpoint_override) {
+      const e = endpointsFor(p, t);
+      if (e.v6) {
+        ep = e.v6;                                   // 双方都有 IPv6: 先走 IPv6
+        if (e.v4) dual = ` ep6=${e.v6} ep4=${e.v4}`; // 有 IPv4 才能兜底
+      }
+    }
     L.push(
       '', '[Peer]', `# ${p.name}`,
-      `# meshlink peer id=${p.id} hub=${p.is_hub ? 1 : 0} online=${isOnline(p, t) ? 1 : 0} nat=${NAT_TYPES.has(p.nat_type) ? p.nat_type : 'unknown'}`,
+      `# meshlink peer id=${p.id} hub=${p.is_hub ? 1 : 0} online=${isOnline(p, t) ? 1 : 0} nat=${NAT_TYPES.has(p.nat_type) ? p.nat_type : 'unknown'}${dual}`,
       `PublicKey = ${p.public_key}`, `AllowedIPs = ${[...new Set(allowed)].join(', ')}`
     );
-    const ep = endpointFor(p, t);
     if (ep) L.push(`Endpoint = ${ep}`);
     L.push('PersistentKeepalive = 25');
   }
@@ -514,7 +537,7 @@ async function handleAgent(request, env, url) {
     const { results: peers } = await env.DB.prepare(
       'SELECT * FROM nodes WHERE network_id=? AND id!=? AND enabled=1 AND public_key IS NOT NULL ORDER BY id'
     ).bind(node.network_id, node.id).all();
-    return textResp(buildConfig(node, node, peers, t));
+    return textResp(buildConfig(node, node, peers, t, { pathCapable: request.headers.get('X-Meshlink-Path') === '1' }));
   }
 
   throw new HttpError(404, 'not found');

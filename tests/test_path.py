@@ -422,5 +422,165 @@ class DaemonTests(unittest.TestCase):
         self.assertIn(('kick', A, '25'), self.wg.calls)
 
 
+# ───────── IPv6 优先、IPv4 兜底 ─────────
+EP6, EP4 = '[2408:8207:1::5]:51820', '203.0.113.7:41000'
+
+
+def peers6(hub_dual=False):
+    ps = peers()
+    ps[1]['endpoint'] = EP6
+    ps[1]['meta'].update(ep6=EP6, ep4=EP4)
+    if hub_dual:
+        ps[0]['endpoint'] = '[2001:db8::1]:51820'
+        ps[0]['meta'].update(ep6='[2001:db8::1]:51820', ep4='198.51.100.1:51820')
+    return ps
+
+
+def dump6(t, a_hs=None, a_rx=0, a_ep='', hub_ep=''):
+    d = dump(t, a_hs=a_hs, a_rx=a_rx)
+    d[A]['endpoint'] = a_ep
+    d[HUB]['endpoint'] = hub_ep
+    return d
+
+
+class FamilyTests(unittest.TestCase):
+    def test_helpers(self):
+        self.assertTrue(mp.ep_is_v6('[2408::1]:51820'))
+        self.assertFalse(mp.ep_is_v6('1.2.3.4:51820'))
+        self.assertFalse(mp.ep_is_v6(''))
+        self.assertEqual(mp.candidates(peers()[1]), [])                 # 没有 ep6/ep4: 沿用旧行为
+        self.assertEqual(mp.candidates(peers6()[1]), [EP6, EP4])
+
+    def test_ipv6_first_and_stays_when_it_works(self):
+        pm = mp.PathManager()
+        r = pm.tick(1000, SELF, peers6(), dump6(1000), 'cone')
+        self.assertEqual(r['endpoints'], {A: EP6})                      # 先试 IPv6
+        t = 1005
+        while t < 1300:
+            r = pm.tick(t, SELF, peers6(), dump6(t, a_hs=t - 20, a_rx=int(t), a_ep=EP6), 'cone')
+            self.assertEqual(r['endpoints'], {}, t)                     # 通了就不再动端点
+            self.assertEqual(r['labels'][A], 'd')
+            t += 5
+        self.assertEqual(pm.endpoint_family(A), 'v6')
+
+    def test_ipv6_fails_then_ipv4_then_relay(self):
+        pm = mp.PathManager()
+        pm.tick(1000, SELF, peers6(), dump6(1000), 'cone')
+        r = pm.tick(1000 + mp.GRACE_V6 + 1, SELF, peers6(), dump6(1021, a_ep=EP6), 'cone')
+        self.assertEqual(r['endpoints'], {A: EP4})                      # IPv6 一个宽限期没握手: 改试 IPv4
+        self.assertIn('IPv6 直连失败', r['events'][0])
+        self.assertEqual(r['labels'][A], 'p')                           # 还没走中转
+        self.assertFalse(r['newly_relayed'])
+        r = pm.tick(1021 + mp.GRACE - 5, SELF, peers6(), dump6(1056, a_ep=EP4), 'cone')
+        self.assertEqual(r['labels'][A], 'p')
+        r = pm.tick(1021 + mp.GRACE + 1, SELF, peers6(), dump6(1062, a_ep=EP4), 'cone')
+        self.assertEqual(r['labels'][A], 'r')                           # 两个都不通才经 Hub 中转
+        self.assertTrue(r['newly_relayed'])
+
+    def test_ipv4_ok_after_ipv6_fails(self):
+        pm = mp.PathManager()
+        pm.tick(1000, SELF, peers6(), dump6(1000), 'cone')
+        pm.tick(1021, SELF, peers6(), dump6(1021, a_ep=EP6), 'cone')
+        r = pm.tick(1030, SELF, peers6(), dump6(1030, a_hs=1028, a_rx=50, a_ep=EP4), 'cone')
+        self.assertEqual(r['labels'][A], 'd')
+        self.assertEqual(r['endpoints'], {})
+        self.assertEqual(pm.endpoint_family(A), 'v4')
+
+    def test_old_session_does_not_count_after_switch(self):
+        # 切换端点前的旧握手不能算新路径通了
+        pm = mp.PathManager()
+        pm.tick(1000, SELF, peers6(), dump6(1000, a_hs=990, a_rx=10, a_ep=EP6), 'cone')   # 重启时已有 IPv6 会话
+        t, rx = 1005, 10
+        r = None
+        while t < 1100:
+            r = pm.tick(t, SELF, peers6(), dump6(t, a_hs=990, a_rx=rx, a_ep=EP6), 'cone')   # 收不到包了
+            if r['endpoints']:
+                break
+            t += 5
+        self.assertEqual(r['endpoints'], {A: EP4})
+        self.assertGreater(t - 1000, mp.RX_STALL - 1)                    # 会话停滞才切，不是一上来就切
+        r = pm.tick(t + 5, SELF, peers6(), dump6(t + 5, a_hs=990, a_rx=rx, a_ep=EP4), 'cone')
+        self.assertEqual(r['labels'][A], 'p')                            # 旧握手不算数，仍在尝试
+
+    def test_live_ipv4_session_not_disturbed_on_start(self):
+        pm = mp.PathManager()
+        r = pm.tick(1000, SELF, peers6(), dump6(1000, a_hs=980, a_rx=10, a_ep='203.0.113.7:41555'), 'cone')
+        self.assertEqual(r['endpoints'], {})                             # 已经在走 IPv4 的会话，不去改它
+        self.assertEqual(pm.endpoint_family(A), 'v4')
+
+    def test_syncconf_reset_is_repaired_when_no_session(self):
+        pm = mp.PathManager()
+        pm.tick(1000, SELF, peers6(), dump6(1000), 'cone')
+        pm.tick(1021, SELF, peers6(), dump6(1021, a_ep=EP6), 'cone')     # 现在在试 IPv4
+        r = pm.tick(1026, SELF, peers6(), dump6(1026, a_ep=EP6), 'cone')  # syncconf 把端点重置回 IPv6
+        self.assertEqual(r['endpoints'], {A: EP4})
+
+    def test_relay_probe_alternates_family(self):
+        pm = mp.PathManager()
+        pm.tick(1000, SELF, peers6(), dump6(1000), 'cone')
+        pm.tick(1021, SELF, peers6(), dump6(1021, a_ep=EP6), 'cone')
+        pm.tick(1062, SELF, peers6(), dump6(1062, a_ep=EP4), 'cone')     # 进入中转，停在 IPv4
+        self.assertEqual(pm.modes(), {A: 'relay'})
+        r = pm.tick(1062 + mp.PROBE_EVERY, SELF, peers6(), dump6(1107, a_ep=EP4), 'cone')
+        self.assertEqual(r['kicks'], [A])
+        self.assertEqual(r['endpoints'], {A: EP6})                       # 探测时换到 IPv6 再试
+        r = pm.tick(1107 + mp.PROBE_EVERY, SELF, peers6(), dump6(1152, a_ep=EP6), 'cone')
+        self.assertEqual(r['endpoints'], {A: EP4})                       # 下一次再换回 IPv4
+
+    def test_hub_peer_also_falls_back_to_ipv4(self):
+        # Hub 没有中转可退，IPv6 不通就改试 IPv4（中心辐射模式下同样适用）
+        pm = mp.PathManager()
+        hubmode = {'mode': 'hub', 'hub': '0'}
+        ps = peers6(hub_dual=True)
+        r = pm.tick(1000, hubmode, ps, dump6(1000, hub_ep='[2001:db8::1]:51820'), 'cone')
+        d = dump6(1021, hub_ep='[2001:db8::1]:51820'); d[HUB]['hs'] = 0
+        r = pm.tick(1021, hubmode, ps, d, 'cone')
+        self.assertEqual(r['endpoints'].get(HUB), '198.51.100.1:51820')
+
+    def test_offline_peer_does_not_burn_ipv6(self):
+        pm = mp.PathManager()
+        ps = peers6(); ps[1]['meta']['online'] = '0'
+        for t in range(1000, 1200, 5):
+            r = pm.tick(t, SELF, ps, dump6(t), 'cone')
+        self.assertEqual(r['endpoints'], {})
+        self.assertEqual(pm.endpoint_family(A), 'v6')
+
+
+class FamilyDaemonTests(unittest.TestCase):
+    def test_daemon_applies_endpoint_switch(self):
+        conf = CONF.replace('# meshlink peer id=3 hub=0 online=1 nat=cone',
+                            '# meshlink peer id=3 hub=0 online=1 nat=cone ep6=%s ep4=%s' % (EP6, EP4))
+        tmp = tempfile.mkdtemp()
+        path = os.path.join(tmp, 'm.conf')
+        with open(path, 'w') as fh: fh.write(conf)
+        clock = [1000.0]
+        wg = FakeWg()
+        wg.set_endpoint = lambda pub, ep: wg.calls.append(('endpoint', pub, ep)) or True
+        d = mp.Daemon('meshlink', 'https://x', 's', path, wg=wg, report_fn=lambda *a: True,
+                      stun_fn=lambda port, rebind: ([('9.9.9.9', '203.0.113.7', 41000), ('8.8.8.8', '203.0.113.7', 41000)], '192.168.1.5'),
+                      clock=lambda: clock[0], status_file=os.path.join(tmp, 'status.json'))
+        d.tick()
+        self.assertIn(('endpoint', A, EP6), wg.calls)
+        clock[0] += mp.GRACE_V6 + 1
+        d.tick()
+        self.assertIn(('endpoint', A, EP4), wg.calls)
+        with open(os.path.join(tmp, 'status.json')) as f:
+            st = json.load(f)
+        self.assertEqual([p['family'] for p in st['peers'] if p['pub'] == A], ['v4'])
+
+    def test_failed_set_endpoint_is_retried(self):
+        conf = CONF.replace('# meshlink peer id=3 hub=0 online=1 nat=cone',
+                            '# meshlink peer id=3 hub=0 online=1 nat=cone ep6=%s ep4=%s' % (EP6, EP4))
+        tmp = tempfile.mkdtemp()
+        path = os.path.join(tmp, 'm.conf')
+        with open(path, 'w') as fh: fh.write(conf)
+        wg, calls = FakeWg(), []
+        wg.set_endpoint = lambda pub, ep: calls.append(ep) or len(calls) > 1
+        d = mp.Daemon('meshlink', 'https://x', 's', path, wg=wg, report_fn=lambda *a: True,
+                      stun_fn=lambda *a: ([], None), clock=lambda: 1000.0, status_file=os.path.join(tmp, 's.json'))
+        d.tick(); d.tick()
+        self.assertEqual(calls, [EP6, EP6])
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=1)

@@ -3,7 +3,7 @@
 #
 # 安装:  curl -fsSL https://<你的域名>/agent.sh | sudo bash -s -- install --server https://<你的域名> --token <令牌>
 # Docker: 见后台“添加节点”里的 Docker / iStoreOS 标签
-# 其他:  meshlink-agent status | sync | stun | upgrade | uninstall
+# 其他:  meshlink-agent status | sync | stun | ipv6 | upgrade | uninstall
 #
 # 私钥只在本机生成并保存在 /etc/meshlink/private.key，不会上传。
 #
@@ -133,36 +133,67 @@ apply_config() {
   fi
 }
 
-# 本机出网用的公网 IPv6（只用于后台展示，不参与隧道）；没有 IPv6 或只有 ULA/链路本地时返回空
-local_ipv6() {
-  local a
-  a=$(ip -6 route get 2606:4700:4700::1111 2>/dev/null | sed -n 's/.* src \([0-9a-fA-F:]*\).*/\1/p' | head -n1)
-  case "$a" in
-    "" | ::1 | fe[89abAB]* | f[cdCD]*) return 0 ;;
+# 是不是可用的公网（全局单播）IPv6: 排除空、回环、链路本地(fe80::/10)、ULA(fc00::/7)
+is_global_v6() {
+  case "$1" in
+    "" | :: | ::1 | fe[89abAB]* | f[cdCD]*) return 1 ;;
+    *:*) return 0 ;;
   esac
-  printf '%s' "$a"
+  return 1
+}
+
+# 本机出网用的公网 IPv6（后台展示；对端也据此判断能否走 IPv6 直连）。没有 IPv6 或只有 ULA/链路本地时返回空。
+# 路由选出的源地址可能是会过期的临时(隐私)地址，所以优先取同一块网卡上的稳定地址。
+local_ipv6() {
+  local line a dev c cand=""
+  line=$(ip -6 route get 2606:4700:4700::1111 2>/dev/null | head -n1)
+  a=$(printf '%s\n' "$line" | sed -n 's/.* src \([0-9a-fA-F:]*\).*/\1/p' | head -n1)
+  dev=$(printf '%s\n' "$line" | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -n1)
+  if [ -n "$dev" ]; then
+    for c in $(ip -6 -o addr show dev "$dev" scope global 2>/dev/null | awk '!/temporary|deprecated/ { split($4, x, "/"); print x[1] }'); do
+      if is_global_v6 "$c"; then cand="$c"; break; fi
+    done
+  fi
+  for c in "$cand" "$a"; do
+    if is_global_v6 "$c"; then printf '%s' "$c"; return 0; fi
+  done
+  return 0
 }
 
 # iStoreOS / OpenWrt (fw4/nftables) 默认丢弃“防火墙不认识的接口”的流量：自动放行 WireGuard 接口与监听端口。
-# 规则加在 fw4 的 input/forward 链最前面并带 meshlink-agent 备注；防火墙重载后规则会丢，下一次同步（≤1 分钟）自动补回。
-# 没有 nft 或没有 fw4 表（普通 Linux）时什么都不做。
+# 规则加在 fw4 的 input/forward 链最前面并带 meshlink-agent 备注（inet 表，IPv4 / IPv6 同时生效）；
+# 防火墙重载后规则会丢，下一次同步（≤1 分钟）自动补回；改了监听端口会自动换掉旧端口的规则。
+# 没有 nft 或没有 fw4 表（普通 Linux / 旧版 fw3-iptables 固件）时什么都不做。
+FW_TAG="meshlink-agent"
+
+# fw_has <链> <规则里应出现的片段>: 该链上是否已有带标记且包含此片段的规则
+fw_has() {
+  nft list chain inet fw4 "$1" 2>/dev/null | grep -F "comment \"$FW_TAG\"" | grep -qF -- "$2"
+}
+
+# fw_add <链> <匹配条件> <日志说明>
+fw_add() {
+  nft "insert rule inet fw4 $1 $2 accept comment \"$FW_TAG\"" 2>/dev/null && log "防火墙(fw4): 已放行 $3"
+}
+
 fw_ensure() {
   command -v nft >/dev/null 2>&1 || return 0
   ip link show "$IFACE" >/dev/null 2>&1 || return 0
   nft list chain inet fw4 input >/dev/null 2>&1 || return 0
-  local port tag="meshlink-agent"
+  local port h
   port=$(sed -n 's/^ListenPort[[:space:]]*=[[:space:]]*\([0-9]\{1,5\}\).*/\1/p' "/etc/wireguard/$IFACE.conf" 2>/dev/null | head -n1)
-  if ! nft list chain inet fw4 input 2>/dev/null | grep -q "$tag"; then
-    nft "insert rule inet fw4 input iifname \"$IFACE\" accept comment \"$tag\"" 2>/dev/null \
-      && log "防火墙(fw4): 已放行 $IFACE 入站"
-    [ -n "$port" ] && nft "insert rule inet fw4 input udp dport $port accept comment \"$tag\"" 2>/dev/null \
-      && log "防火墙(fw4): 已放行 UDP $port 入站"
+
+  fw_has input "iifname \"$IFACE\"" || fw_add input "iifname \"$IFACE\"" "$IFACE 入站"
+  if [ -n "$port" ]; then
+    # 监听端口被改过: 先删掉旧端口的规则
+    for h in $(nft -a list chain inet fw4 input 2>/dev/null | awk -v tag="comment \"$FW_TAG\"" -v keep="udp dport $port " \
+        'index($0, tag) && index($0, "udp dport ") && !index($0, keep) { print $NF }'); do
+      nft delete rule inet fw4 input handle "$h" 2>/dev/null
+    done
+    fw_has input "udp dport $port " || fw_add input "udp dport $port" "UDP $port 入站（IPv4/IPv6）"
   fi
-  if ! nft list chain inet fw4 forward 2>/dev/null | grep -q "$tag"; then
-    nft "insert rule inet fw4 forward iifname \"$IFACE\" accept comment \"$tag\"" 2>/dev/null \
-      && nft "insert rule inet fw4 forward oifname \"$IFACE\" accept comment \"$tag\"" 2>/dev/null \
-      && log "防火墙(fw4): 已放行 $IFACE 转发"
-  fi
+  fw_has forward "iifname \"$IFACE\"" || fw_add forward "iifname \"$IFACE\"" "$IFACE 转发(入)"
+  fw_has forward "oifname \"$IFACE\"" || fw_add forward "oifname \"$IFACE\"" "$IFACE 转发(出)"
   return 0
 }
 
@@ -171,6 +202,8 @@ do_sync() {
   tmp=$(mktemp) && new=$(mktemp) || return 1
   v6=$(local_ipv6)
   [ -n "$v6" ] && hdr=(-H "X-Meshlink-IPv6: $v6")
+  # 装了路径管理器才声明: 控制面据此决定双方都有 IPv6 时是否先走 IPv6（没有它就没法在 IPv6 不通时改回 IPv4）
+  [ -f "$PYBIN" ] && have_python && hdr+=(-H "X-Meshlink-Path: 1")
   code=$(curl -sS --max-time 20 -o "$tmp" -w '%{http_code}' -X POST \
     -H "Authorization: Bearer $SECRET" ${hdr[@]+"${hdr[@]}"} "$SERVER/api/agent/sync" 2>/dev/null) || code=000
   case "$code" in
@@ -285,6 +318,23 @@ cmd_status() {
   fi
 }
 
+# 排查“后台为什么没有 IPv6”: 显示本机到公网的 IPv6 路由、全局地址，以及 agent 实际会上报什么
+cmd_ipv6() {
+  echo "== 到公网的 IPv6 路由 =="
+  ip -6 route get 2606:4700:4700::1111 2>&1 | head -n1
+  echo "== 全局 IPv6 地址 =="
+  ip -6 -o addr show scope global 2>&1 | awk '{ printf "  %s  %s  %s\n", $2, $4, ($0 ~ /temporary/ ? "(临时地址)" : ($0 ~ /deprecated/ ? "(已弃用)" : "")) }'
+  local v6; v6=$(local_ipv6)
+  echo "== agent 将上报 =="
+  if [ -n "$v6" ]; then
+    echo "  $v6"
+  else
+    echo "  （无）没有可用的公网 IPv6：没有 IPv6 默认路由，或只有 ULA(fd..)/链路本地(fe80..) 地址"
+  fi
+  echo "== 路径管理器（IPv6 优先、IPv4 兜底依赖它） =="
+  if [ -f "$PYBIN" ] && have_python; then echo "  已安装"; else echo "  未安装或没有 python3：只会使用 IPv4"; fi
+}
+
 cmd_stun() {
   [ -f "$PYBIN" ] && have_python || die "未安装路径管理器或 python3，请先执行 upgrade"
   python3 -I "$PYBIN" stun "$@"
@@ -359,9 +409,10 @@ main() {
     sync) need_root; load_env; do_sync ;;
     status) cmd_status ;;
     stun) cmd_stun "$@" ;;
+    ipv6) cmd_ipv6 ;;
     upgrade) cmd_upgrade ;;
     uninstall) cmd_uninstall ;;
-    *) echo "用法: $0 {install --server URL --token TOKEN | run | sync | status | stun | upgrade | uninstall}"; exit 1 ;;
+    *) echo "用法: $0 {install --server URL --token TOKEN | run | sync | status | stun | ipv6 | upgrade | uninstall}"; exit 1 ;;
   esac
 }
 

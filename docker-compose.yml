@@ -24,9 +24,10 @@ services:
       - |
         set -e
         export DEBIAN_FRONTEND=noninteractive
-        if ! command -v wg-quick >/dev/null 2>&1; then
+        if ! command -v wg-quick >/dev/null 2>&1 || ! command -v nft >/dev/null 2>&1; then
           apt-get update
-          apt-get install -y --no-install-recommends wireguard-tools iproute2 iptables procps python3 curl ca-certificates hostname
+          # nftables: agent 用它在 iStoreOS/OpenWrt 的 fw4 防火墙里自动放行 WireGuard 接口和 UDP 端口
+          apt-get install -y --no-install-recommends wireguard-tools iproute2 iptables nftables procps python3 curl ca-certificates hostname
         fi
         if [ ! -f /etc/meshlink/agent.env ]; then
           curl -fsSL "$$SERVER/agent.sh" | bash -s -- install --server "$$SERVER" --token "$$TOKEN"
