@@ -16,6 +16,7 @@ spec = importlib.util.spec_from_file_location('mp', os.path.join(HERE, '..', 'pu
 mp = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(mp)
 sys.dont_write_bytecode = True
+mp.ping_rtt = lambda *a, **k: None      # 测试里不发真实 ICMP；需要延迟的用例自己传 ping_fn
 
 HUB, A, B = 'H' * 43 + '=', 'A' * 43 + '=', 'B' * 43 + '='
 
@@ -580,6 +581,148 @@ class FamilyDaemonTests(unittest.TestCase):
                       stun_fn=lambda *a: ([], None), clock=lambda: 1000.0, status_file=os.path.join(tmp, 's.json'))
         d.tick(); d.tick()
         self.assertEqual(calls, [EP6, EP6])
+
+
+# ───────── 延迟测量 ─────────
+class PingHelperTests(unittest.TestCase):
+    def test_echo_checksum_is_valid(self):
+        pkt = mp.icmp_echo(0x1234, 7)
+        self.assertEqual(pkt[0], 8)                                  # Echo Request
+        self.assertEqual(mp.icmp_checksum(pkt), 0)                   # 含校验和的整包再算一遍应为 0
+
+    def test_reply_matching(self):
+        ip_hdr = bytes([0x45]) + bytes(19)                           # 20 字节 IP 头
+        reply = ip_hdr + struct.pack('>BBHHH', 0, 0, 0, 0x1234, 7)
+        self.assertTrue(mp.icmp_is_reply(reply, 0x1234, 7))
+        self.assertFalse(mp.icmp_is_reply(reply, 0x1234, 8))         # seq 不符
+        self.assertFalse(mp.icmp_is_reply(reply, 0x4321, 7))         # id 不符
+        req = ip_hdr + struct.pack('>BBHHH', 8, 0, 0, 0x1234, 7)
+        self.assertFalse(mp.icmp_is_reply(req, 0x1234, 7))           # 不是 Echo Reply
+        self.assertFalse(mp.icmp_is_reply(b'short', 1, 1))
+
+    def test_parse_ping_output(self):
+        gnu = '64 bytes from 10.88.0.3: icmp_seq=1 ttl=64 time=23.4 ms\n64 bytes from 10.88.0.3: icmp_seq=2 ttl=64 time=21.9 ms\n'
+        busybox = '64 bytes from 10.88.0.3: seq=0 ttl=64 time=0.532 ms\n'
+        self.assertAlmostEqual(mp.parse_ping(gnu), 21.9)
+        self.assertAlmostEqual(mp.parse_ping(busybox), 0.532)
+        self.assertIsNone(mp.parse_ping('100% packet loss'))
+        self.assertIsNone(mp.parse_ping(None))
+
+    def test_peer_ip(self):
+        self.assertEqual(mp.peer_ip(peers()[1]), '10.88.0.3')
+        self.assertIsNone(mp.peer_ip({'allowed': ['192.168.7.0/24']}))
+
+
+class LatencyDaemonTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.conf_path = os.path.join(self.tmp, 'm.conf')
+        with open(self.conf_path, 'w') as f:
+            f.write(CONF)
+        self.clock, self.wg, self.reports, self.pings = [1000.0], FakeWg(), [], []
+        self.values = [20.0]
+        self.wg.state[A]['hs'] = 999            # A 已握手 -> 直连
+
+        def ping(ip):
+            self.pings.append(ip)
+            return self.values[0]
+        self.d = mp.Daemon('meshlink', 'https://x', 's', self.conf_path, wg=self.wg,
+                           report_fn=lambda *a: self.reports.append(a) or True,
+                           stun_fn=lambda port, rebind: ([], None), clock=lambda: self.clock[0],
+                           status_file=os.path.join(self.tmp, 'status.json'), ping_fn=ping)
+
+    def tick(self, secs=0):
+        self.clock[0] += secs
+        self.wg.state[A]['hs'] = int(self.clock[0]) - 1      # 保持握手新鲜
+        self.wg.state[A]['rx'] += 10
+        self.wg.state[HUB]['hs'] = int(self.clock[0]) - 5
+        self.d.tick()
+
+    def test_direct_peer_reports_latency(self):
+        self.tick()
+        self.assertEqual(self.pings, ['10.88.0.3'])          # 只测对端虚拟 IP，Hub 不在路径表里
+        self.assertEqual(self.d.paths_str, '3:d:20')
+        with open(os.path.join(self.tmp, 'status.json')) as f:
+            st = json.load(f)
+        self.assertEqual([p['rtt'] for p in st['peers'] if p['pub'] == A], [20])
+        self.assertEqual(self.reports[-1][2], '3:d:20')
+
+    def test_measure_interval(self):
+        self.tick(); self.tick(5); self.tick(5)
+        self.assertEqual(len(self.pings), 1)                  # LAT_INTERVAL 内不重复测
+        self.tick(mp.LAT_INTERVAL)
+        self.assertEqual(len(self.pings), 2)
+
+    def test_small_jitter_does_not_change_report(self):
+        self.tick()
+        n = len(self.reports)
+        self.values[0] = 23.0                                 # 抖动在迟滞范围内
+        self.tick(mp.LAT_INTERVAL)
+        self.assertEqual(self.d.paths_str, '3:d:20')
+        self.assertEqual(self.d.rtt_ms(A), 23)                # 本地状态文件仍是最新值
+        self.assertEqual(len(self.reports), n)                # 不会为了抖动多上报一次
+        self.values[0] = 60.0                                 # 明显变化才更新
+        self.tick(mp.LAT_INTERVAL)
+        self.assertEqual(self.d.paths_str, '3:d:60')
+
+    def test_failed_ping_keeps_state_without_latency(self):
+        self.values[0] = None
+        self.tick()
+        self.assertEqual(self.d.paths_str, '3:d')
+        self.assertIsNone(self.d.rtt_ms(A))
+
+    def test_stale_latency_expires(self):
+        self.tick()
+        self.values[0] = None
+        for _ in range(0, mp.LAT_TTL + mp.LAT_INTERVAL + 1, mp.LAT_INTERVAL):
+            self.tick(mp.LAT_INTERVAL)
+        self.assertEqual(self.d.paths_str, '3:d')
+
+    def test_no_ping_while_trying(self):
+        self.wg.state[A]['hs'] = 0                            # 从未握手 -> 尝试中
+        self.clock[0] += 1
+        self.d.tick()
+        self.assertEqual(self.d.paths_str, '3:p')
+        self.assertEqual(self.pings, [])
+
+    def test_latency_dropped_when_path_switches_to_relay(self):
+        self.tick()
+        self.assertEqual(self.d.paths_str, '3:d:20')
+        self.clock[0] += 1
+        self.wg.state[HUB]['hs'] = int(self.clock[0]) - 5
+        self.wg.state[A]['hs'] = 0                            # 直连断了
+        for _ in range(0, 130, 5):
+            self.clock[0] += 5
+            self.wg.state[HUB]['hs'] = int(self.clock[0]) - 5
+            self.d.tick()
+            if self.d.paths_str.startswith('3:r'):
+                break
+        self.assertTrue(self.d.paths_str.startswith('3:r'))
+        self.values[0] = 95.0                                 # 中转路径的延迟更高
+        self.clock[0] += mp.LAT_INTERVAL
+        self.wg.state[HUB]['hs'] = int(self.clock[0]) - 5
+        self.d.tick()
+        self.assertEqual(self.d.paths_str, '3:r:95')
+
+
+class AliveReportTests(unittest.TestCase):
+    def test_alive_lists_peers_with_fresh_handshake(self):
+        tmp = tempfile.mkdtemp()
+        path = os.path.join(tmp, 'm.conf')
+        with open(path, 'w') as fh: fh.write(CONF)
+        clock, wg, reports = [1000.0], FakeWg(), []
+        d = mp.Daemon('meshlink', 'https://x', 's', path, wg=wg, report_fn=lambda *a: reports.append(a) or True,
+                      stun_fn=lambda *a: ([], None), clock=lambda: clock[0], status_file=os.path.join(tmp, 's.json'))
+        wg.state[HUB]['hs'] = 995                   # Hub 刚握手；A 从未握手
+        d.tick()
+        self.assertEqual(reports[-1][3], '1')
+        clock[0] += 5; wg.state[A]['hs'] = 1000      # A 也握手了 -> 立刻上报
+        wg.state[HUB]['hs'] = 1000
+        d.tick()
+        self.assertEqual(reports[-1][3], '1,3')
+        clock[0] += mp.SESSION_MAX + 10              # 握手都过期 -> 变成空，也要上报
+        d.tick()
+        self.assertEqual(reports[-1][3], '')
 
 
 if __name__ == '__main__':

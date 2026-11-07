@@ -67,6 +67,8 @@ tr:last-child td{border-bottom:0}
 .b-ok i{background:var(--ok);box-shadow:0 0 8px rgba(52,211,153,.7)}
 .b-warn i{background:var(--warn)}.b-warn{color:var(--warn)}
 .b-bad i{background:var(--bad)}.b-bad{color:var(--bad)}
+.pr{display:flex;align-items:center;gap:6px;font-size:12px;line-height:1.7;white-space:nowrap}
+.pr b{font-weight:500}
 .tag{font-size:11px;padding:1px 8px;border-radius:99px;background:rgba(77,141,255,.16);border:1px solid rgba(77,141,255,.4);color:#a9ccff;margin-left:6px}
 .notice{padding:11px 16px;border-radius:12px;border:1px solid rgba(251,191,36,.4);background:rgba(251,191,36,.07);color:var(--warn);font-size:13px}
 .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:13px}
@@ -222,12 +224,22 @@ function statusBadge(n) {
   if (!n.enabled) return '<span class="badge b-bad"><i></i>已禁用</span>';
   if (n.is_client) return '<span class="badge"><i></i>客户端</span>';
   if (!n.registered) return '<span class="badge b-warn"><i></i>待安装</span>';
+  if (n.online && n.observed) {
+    return '<span class="badge b-ok" title="该节点的 agent 没有同步控制面（可能连不上控制面域名，或 agent 已停止），但其他节点能和它建立 WireGuard 握手，隧道可用。请在该节点执行 meshlink-agent status 排查。"><i></i>在线<span class="muted">（仅隧道）</span></span>';
+  }
   return n.online ? '<span class="badge b-ok"><i></i>在线</span>' : '<span class="badge"><i></i>离线</span>';
 }
 
 const NAT_LABEL = { public: '公网', cone: '锥形', symmetric: '对称', unknown: '未知' };
 
-// NAT 类型 + 到各在线对端的路径统计（d 直连 / p 尝试中 / r 经 Hub 中转）
+// 往返延迟: 越低越好，颜色只做提示
+function rttHtml(ms) {
+  if (ms === undefined || ms === null) return '<span class="muted">-</span>';
+  const c = ms < 80 ? 'var(--ok)' : ms < 200 ? 'var(--warn)' : 'var(--bad)';
+  return `<span class="mono" style="color:${c}">${ms} ms</span>`;
+}
+
+// NAT 类型 + 逐个在线对端的路径（d 直连 / p 尝试中 / r 经 Hub 中转）和往返延迟
 function pathCell(n, net) {
   if (!n.registered || !n.online) return '<span class="muted">-</span>';
   const nat = n.nat_type
@@ -235,14 +247,14 @@ function pathCell(n, net) {
   if (net.mode === 'hub') return `${nat} <span class="muted">经 Hub</span>`;
   const byId = new Map(nodes.map((x) => [x.id, x]));
   const live = (n.paths || []).filter((p) => byId.get(p.peer_id) && byId.get(p.peer_id).online);
-  const c = { d: 0, p: 0, r: 0 };
-  for (const p of live) if (p.state in c) c[p.state]++;
-  const relayNames = live.filter((p) => p.state === 'r').map((p) => byId.get(p.peer_id).name).join('、');
-  const parts = [];
-  if (c.d) parts.push(`<span style="color:var(--ok)">直连 ${c.d}</span>`);
-  if (c.p) parts.push(`<span class="muted">尝试中 ${c.p}</span>`);
-  if (c.r) parts.push(`<span style="color:var(--warn)" title="${esc('经 Hub 中转: ' + relayNames)}">中转 ${c.r}</span>`);
-  return nat + (parts.length ? ' ' + parts.join(' · ') : '');
+  const STATE = {
+    d: '<b style="color:var(--ok)">直连</b>',
+    p: '<b class="muted">尝试中</b>',
+    r: '<b style="color:var(--warn)" title="直连打不通，流量经 Hub 转发">中转</b>',
+  };
+  const rows = live.filter((p) => p.state in STATE).map((p) =>
+    `<div class="pr"><span class="muted">${esc(byId.get(p.peer_id).name)}</span>${STATE[p.state]}${p.state === 'p' ? '' : rttHtml(p.rtt)}</div>`);
+  return nat + (rows.length ? rows.join('') : '');
 }
 
 function renderDetail() {

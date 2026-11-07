@@ -9,6 +9,8 @@
      两个都不通（或已建立的会话长时间收不到包）才判定直连失败。
   3. 自动回落: 直连失败的对端，把它的 AllowedIPs 挪到 Hub 上，流量经 Hub 中转；之后定期探测，
      直连恢复后自动切回。
+  4. 延迟测量: 对每个“直连 / 中转”中的对端，定期 ICMP ping 它的虚拟 IP（走的就是当前实际路径），
+     把往返延迟随路径状态一起上报，后台逐对端显示“直连/中转 + 延迟”。
 
 只依赖 Python 3.6+ 标准库、wg 和 curl。用法:
   meshlink-path.py run        守护进程（agent 调用）
@@ -52,6 +54,10 @@ RECOVER_OK = 2         # 连续几次检查都满足才切回，防抖
 REPORT_HEARTBEAT = 900  # 秒；状态没变化时的心跳上报间隔（控制面 30 分钟后视 STUN 结果过期）
 REPORT_MIN_GAP = 5
 REPORT_RETRY = 30
+LAT_INTERVAL = 30      # 秒；同一个对端两次测延迟的最小间隔
+LAT_BUDGET = 3.0       # 秒；每个 TICK 里测延迟最多占用的时间，避免拖慢路径检测
+LAT_TTL = 120          # 秒；超过这么久没测到就不再显示旧延迟
+LAT_COUNT = 2          # 每次测量发几个包，取最小值
 
 
 def out(s=''):
@@ -179,6 +185,101 @@ def stun_classify(results, local_ip):
         return endpoint, 'unknown'
     same = all((r[1], r[2]) == (ip, port) for r in results)
     return endpoint, 'cone' if same else 'symmetric'
+
+
+# ───────────────────────── 延迟测量 ─────────────────────────
+
+PING_RE = re.compile(r'time[=<]\s*([0-9]+(?:\.[0-9]+)?)\s*ms')
+
+
+def icmp_checksum(data):
+    if len(data) % 2:
+        data += b'\x00'
+    total = sum(struct.unpack('>%dH' % (len(data) // 2), data))
+    total = (total >> 16) + (total & 0xFFFF)
+    total += total >> 16
+    return ~total & 0xFFFF
+
+
+def icmp_echo(ident, seq, payload=b'meshlink-rtt'):
+    """构造 ICMP Echo Request 报文。"""
+    head = struct.pack('>BBHHH', 8, 0, 0, ident, seq)
+    chk = icmp_checksum(head + payload)
+    return struct.pack('>BBHHH', 8, 0, chk, ident, seq) + payload
+
+
+def icmp_is_reply(data, ident, seq):
+    """raw socket 收到的是带 IP 头的包；判断是不是对应 (ident, seq) 的 Echo Reply。"""
+    if len(data) < 20:
+        return False
+    ihl = (data[0] & 0x0F) * 4
+    if len(data) < ihl + 8:
+        return False
+    typ, code, _chk, rid, rseq = struct.unpack('>BBHHH', data[ihl:ihl + 8])
+    return typ == 0 and code == 0 and rid == ident and rseq == seq
+
+
+def parse_ping(text):
+    """解析系统 ping 的输出，返回最小的往返延迟（毫秒）或 None。"""
+    vals = [float(x) for x in PING_RE.findall(text or '')]
+    return min(vals) if vals else None
+
+
+def ping_cmd_rtt(ip, count=LAT_COUNT, wait=1):
+    """没有 raw socket 权限时退回系统 ping（busybox / iputils 都支持 -c / -W）。"""
+    try:
+        r = subprocess.run(['ping', '-c', str(count), '-W', str(wait), ip], stdout=subprocess.PIPE,
+                           stderr=subprocess.DEVNULL, universal_newlines=True, timeout=count * wait + 3)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return parse_ping(r.stdout)
+
+
+def ping_rtt(ip, count=LAT_COUNT, timeout=1.0):
+    """向 ip 发 ICMP Echo，返回最小往返延迟（毫秒，float）；不通返回 None。
+    优先用 raw socket（不依赖 ping 命令，root 运行的 agent 都可用），失败再退回系统 ping。"""
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
+    except OSError:
+        return ping_cmd_rtt(ip, count)
+    ident = os.getpid() & 0xFFFF
+    best = None
+    try:
+        for seq in range(count):
+            try:
+                sock.sendto(icmp_echo(ident, seq), (ip, 0))
+            except OSError:
+                break
+            t0 = time.perf_counter()
+            end = t0 + timeout
+            while True:
+                left = end - time.perf_counter()
+                if left <= 0:
+                    break
+                sock.settimeout(left)
+                try:
+                    data, frm = sock.recvfrom(2048)
+                except OSError:                       # 含 socket.timeout
+                    break
+                if frm[0] == ip and icmp_is_reply(data, ident, seq):
+                    rtt = (time.perf_counter() - t0) * 1000.0
+                    best = rtt if best is None else min(best, rtt)
+                    break
+    finally:
+        sock.close()
+    return best
+
+
+def peer_ip(peer):
+    """对端的虚拟 IP（AllowedIPs 里第一个 IPv4 /32）。"""
+    for a in peer['allowed']:
+        if a.endswith('/32') and ':' not in a:
+            return a[:-3]
+    return None
+
+
+def fmt_rtt(ms):
+    return '-' if ms is None else ('%d ms' % ms)
 
 
 # ───────────────────────── 配置 / wg 输出解析 ─────────────────────────
@@ -522,12 +623,13 @@ def load_env(path=ENV_FILE):
     return env
 
 
-def http_report(server, secret, endpoint, nat, paths):
+def http_report(server, secret, endpoint, nat, paths, alive=''):
     """用 curl 上报（与 agent 同一套网络/证书环境）；令牌走 stdin 的 curl 配置，不出现在进程参数里。"""
     cfg = 'header = "Authorization: Bearer %s"\n' % secret
     cmd = ['curl', '-sS', '--max-time', '15', '-o', '/dev/null', '-w', '%{http_code}', '-K', '-', '-X', 'POST',
            '--data-urlencode', 'stun=' + endpoint, '--data-urlencode', 'nat=' + nat,
-           '--data-urlencode', 'paths=' + paths, server.rstrip('/') + '/api/agent/report']
+           '--data-urlencode', 'paths=' + paths, '--data-urlencode', 'alive=' + alive,
+           server.rstrip('/') + '/api/agent/report']
     try:
         r = subprocess.run(cmd, input=cfg, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                            universal_newlines=True, timeout=20)
@@ -538,13 +640,17 @@ def http_report(server, secret, endpoint, nat, paths):
 
 class Daemon:
     def __init__(self, iface, server, secret, conf_path, stun_servers=None, wg=None, report_fn=None,
-                 stun_fn=None, clock=time.time, status_file=STATUS_FILE):
+                 stun_fn=None, clock=time.time, status_file=STATUS_FILE, ping_fn=None):
         self.iface, self.server, self.secret = iface, server, secret
         self.conf_path, self.status_file = conf_path, status_file
         self.stun_servers = stun_servers or DEFAULT_STUN
         self.wg = wg or Wg(iface)
-        self.report_fn = report_fn or (lambda e, n, p: http_report(server, secret, e, n, p))
+        self.report_fn = report_fn or (lambda e, n, p, a='': http_report(server, secret, e, n, p, a))
         self.stun_fn = stun_fn or self._real_stun
+        self.ping_fn = ping_fn or ping_rtt
+        self.rtt = {}           # pub -> (毫秒, 测量时间)；用于状态文件 / 命令行显示
+        self.rtt_rep = {}       # pub -> 上报用的延迟（带迟滞，避免每次抖动都触发上报）
+        self.rtt_try = {}       # pub -> 上次尝试测量的时间
         self.now = clock
         self.pm = PathManager()
         self.endpoint, self.nat = None, 'unknown'
@@ -553,6 +659,7 @@ class Daemon:
         self.next_stun = 0.0
         self.reported, self.last_report, self.last_try = None, 0.0, 0.0
         self.paths_str = ''
+        self.alive_str = ''
         self.last_labels = {}
         self._conf_cache = (None, None)
         self.pm.preload(self._load_modes(), self.now())
@@ -572,6 +679,7 @@ class Daemon:
             rows.append({'id': p['meta'].get('id'), 'name': p['name'], 'pub': p['pub'],
                          'hub': p['meta'].get('hub') == '1', 'state': labels.get(p['pub'], ''),
                          'hs_age': int(t - d['hs']) if d.get('hs') else None, 'nat': p['meta'].get('nat', 'unknown'),
+                         'rtt': self.rtt_ms(p['pub']),
                          'family': self.pm.endpoint_family(p['pub']) or
                                    (('v6' if ep_is_v6(d.get('endpoint')) else 'v4') if d.get('endpoint') not in (None, '', '(none)') else '')})
         data = {'ts': int(t), 'nat': self.nat, 'endpoint': self.endpoint, 'peers': rows, 'modes': self.pm.modes()}
@@ -626,10 +734,52 @@ class Daemon:
             if self.stun_fail >= 3:
                 self.endpoint, self.nat = None, 'unknown'
 
+    # ---- 延迟 ----
+    def measure_latency(self, t, peers, labels):
+        """只测“直连 / 中转”中的对端（尝试中的没有可用路径）。ping 的是对端虚拟 IP，
+        所以中转状态下测到的是经 Hub 绕一圈的真实延迟。路径状态变了就丢掉旧值重测。"""
+        ips = {p['pub']: peer_ip(p) for p in peers}
+        due = []
+        for pub in list(self.rtt_try):
+            if labels.get(pub) not in ('d', 'r') or not ips.get(pub):
+                for m in (self.rtt, self.rtt_rep, self.rtt_try):
+                    m.pop(pub, None)
+        for pub, state in labels.items():
+            if state not in ('d', 'r') or not ips.get(pub):
+                continue
+            if self.last_labels.get(pub) != state:       # 直连 <-> 中转 切换，旧延迟作废
+                for m in (self.rtt, self.rtt_rep, self.rtt_try):
+                    m.pop(pub, None)
+            if t - self.rtt_try.get(pub, -1e9) >= LAT_INTERVAL:
+                due.append(pub)
+        due.sort(key=lambda k: self.rtt_try.get(k, -1e9))
+        started = time.monotonic()
+        for pub in due:
+            if time.monotonic() - started >= LAT_BUDGET:
+                break
+            self.rtt_try[pub] = t
+            try:
+                ms = self.ping_fn(ips[pub])
+            except Exception:
+                ms = None
+            if ms is None:
+                continue
+            self.rtt[pub] = (ms, t)
+            old = self.rtt_rep.get(pub)
+            if old is None or abs(ms - old) > max(5.0, old * 0.25):
+                self.rtt_rep[pub] = max(1, int(round(ms)))
+        for pub in [k for k, v in self.rtt.items() if t - v[1] > LAT_TTL]:
+            for m in (self.rtt, self.rtt_rep):
+                m.pop(pub, None)
+
+    def rtt_ms(self, pub):
+        v = self.rtt.get(pub)
+        return None if v is None else max(1, int(round(v[0])))
+
     # ---- 上报 ----
     def maybe_report(self, t):
         """状态变化立即上报；没变化也每 REPORT_HEARTBEAT 秒上报一次（控制面据此判断 STUN 结果是否过期）。"""
-        snap = (self.endpoint or '', self.nat, self.paths_str)
+        snap = (self.endpoint or '', self.nat, self.paths_str, self.alive_str)
         if snap == self.reported and t - self.last_report < REPORT_HEARTBEAT:
             return
         failed_before = self.last_try > self.last_report
@@ -694,9 +844,19 @@ class Daemon:
         for pub in res['kicks']:
             self.wg.kick(pub, keep.get(pub))
 
+        self.measure_latency(t, peers, res['labels'])
         self.last_labels = res['labels']
-        self.paths_str = ','.join('%s:%s' % (p['meta']['id'], res['labels'][p['pub']])
-                                  for p in peers if p['pub'] in res['labels'] and p['meta'].get('id', '').isdigit())
+
+        def path_item(p):
+            item = '%s:%s' % (p['meta']['id'], res['labels'][p['pub']])
+            ms = self.rtt_rep.get(p['pub'])
+            return item if ms is None else '%s:%d' % (item, ms)
+        self.paths_str = ','.join(path_item(p) for p in peers
+                                  if p['pub'] in res['labels'] and p['meta'].get('id', '').isdigit())
+        # 和哪些对端有新鲜握手（含 Hub）：上报给控制面，这样即使对端的 agent 连不上控制面，后台也知道它的隧道还活着
+        self.alive_str = ','.join(sorted(
+            (p['meta']['id'] for p in peers if p['meta'].get('id', '').isdigit()
+             and dump.get(p['pub'], {}).get('hs') and t - dump[p['pub']]['hs'] < SESSION_MAX), key=int))
         self._write_status(t, peers, dump, res['labels'])
         self.maybe_report(t)
 
@@ -742,7 +902,8 @@ def cmd_status():
         for p in rows:
             hs = ('握手 %ds 前' % p['hs_age']) if p.get('hs_age') is not None else '尚未握手'
             fam = {'v6': 'IPv6', 'v4': 'IPv4'}.get(p.get('family'), '-')
-            out('  %-20s %-12s %-5s %s' % (p.get('name') or p['pub'][:8], STATE_TEXT.get(p.get('state'), '-'), fam, hs))
+            out('  %-20s %-12s %-5s %-8s %s' % (p.get('name') or p['pub'][:8], STATE_TEXT.get(p.get('state'), '-'), fam,
+                                                 fmt_rtt(p.get('rtt')), hs))
     return 0
 
 

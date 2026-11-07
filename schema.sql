@@ -27,6 +27,7 @@ CREATE TABLE IF NOT EXISTS nodes (
   stun_endpoint     TEXT,                        -- agent 经 STUN 探测到的公网映射端点 ip:port
   stun_at           INTEGER,                     -- 上次上报 STUN 结果的时间
   nat_type          TEXT,                        -- public | cone | symmetric | unknown
+  alive             TEXT,                        -- agent 上报的“有新鲜握手的对端 ID”，用来判断 agent 没同步但隧道还活着的节点
   paths             TEXT,                        -- 到各对端的路径状态 "对端ID:d|p|r,..."（d 直连 / p 尝试中 / r 中转）
   created_at        INTEGER NOT NULL,
   UNIQUE (network_id, ip),

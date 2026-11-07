@@ -180,11 +180,11 @@ function normStun(v) {
   return `${m[1]}:${port}`;
 }
 
-// 路径状态 "id:d,id:p,id:r"；d=直连 p=尝试中 r=中转
+// 路径状态 "id:d,id:p,id:r"；d=直连 p=尝试中 r=中转；可在状态后附带往返延迟（毫秒）如 "id:d:23"
 function normPaths(v) {
   const out = [];
   for (const item of String(v ?? '').split(',').filter(Boolean).slice(0, 200)) {
-    if (!/^\d{1,10}:[dpr]$/.test(item)) throw new HttpError(400, 'paths 格式无效');
+    if (!/^\d{1,10}:[dpr](?::\d{1,5})?$/.test(item)) throw new HttpError(400, 'paths 格式无效');
     out.push(item);
   }
   return out.join(',');
@@ -192,9 +192,19 @@ function normPaths(v) {
 
 function parsePaths(v) {
   return String(v || '').split(',').filter(Boolean).map((x) => {
-    const [id, state] = x.split(':');
-    return { peer_id: Number(id), state };
+    const [id, state, rtt] = x.split(':');
+    return rtt === undefined ? { peer_id: Number(id), state } : { peer_id: Number(id), state, rtt: Number(rtt) };
   });
+}
+
+// agent 上报的“有新鲜握手的对端 ID”，逗号分隔
+function normAlive(v) {
+  const ids = new Set();
+  for (const x of String(v ?? '').split(',').filter(Boolean).slice(0, 200)) {
+    if (!/^\d{1,10}$/.test(x)) throw new HttpError(400, 'alive 格式无效');
+    ids.add(Number(x));
+  }
+  return [...ids].sort((a, b) => a - b).join(',');
 }
 
 function parseNodeFields(b) {
@@ -323,7 +333,17 @@ async function createClient(env, netId, body) {
   throw new HttpError(409, '分配地址失败，请重试');
 }
 
-const isOnline = (n, t) => !!(n.enabled && n.last_seen && t - n.last_seen < ONLINE_WINDOW);
+// 在线 = 最近同步过控制面；或者 agent 连不上控制面（被墙 / agent 挂了），但其他在线节点能和它握手（隧道还活着）
+const isOnline = (n, t) => !!(n.enabled && ((n.last_seen && t - n.last_seen < ONLINE_WINDOW) || n.observed));
+
+// 在线的节点会上报“我和哪些对端有新鲜握手”(alive)；据此把没同步、但隧道还活着的节点标成 observed
+function markObserved(list, t) {
+  const seen = new Set();
+  for (const r of list) {
+    if (r.alive && isOnline(r, t)) for (const x of String(r.alive).split(',')) seen.add(Number(x));
+  }
+  for (const r of list) if (!r.observed && seen.has(r.id)) r.observed = true;
+}
 
 // 后台“公网端点”列：IPv4 / IPv6 分开显示
 //   IPv4: 手动指定 > 新鲜的 STUN 端点 > 控制面看到的 IPv4；IPv6: 手动指定的 IPv6 > agent 上报的 > 控制面看到的 IPv6
@@ -355,6 +375,7 @@ function publicNode(n, t) {
     last_ip: n.last_ip || '',
     last_seen: n.last_seen || null,
     online: isOnline(n, t),
+    observed: !!n.observed && !(n.last_seen && t - n.last_seen < ONLINE_WINDOW),   // 仅隧道在线: agent 没有同步控制面
     nat_type: n.nat_type || '',
     stun_endpoint: n.stun_endpoint && n.stun_at && t - n.stun_at < STUN_FRESH ? n.stun_endpoint : '',
     ...publicAddrs(n, t),
@@ -502,9 +523,23 @@ async function handleAgent(request, env, url) {
     if (!NAT_TYPES.has(nat)) throw new HttpError(400, 'nat 类型无效');
     const stun = normStun(form.get('stun'));
     const paths = normPaths(form.get('paths'));
+    const alive = form.has('alive') ? normAlive(form.get('alive')) : null;     // 旧版 agent 不带 alive: 保持原值
     try {
-      await env.DB.prepare('UPDATE nodes SET stun_endpoint=?, stun_at=?, nat_type=?, paths=? WHERE id=?')
-        .bind(stun || null, stun ? now() : null, nat, paths, node.id).run();
+      const base = 'UPDATE nodes SET stun_endpoint=?, stun_at=?, nat_type=?, paths=?';
+      const args = [stun || null, stun ? now() : null, nat, paths];
+      if (alive === null) {
+        await env.DB.prepare(base + ' WHERE id=?').bind(...args, node.id).run();
+      } else {
+        const upd = () => env.DB.prepare(base + ', alive=? WHERE id=?').bind(...args, alive, node.id).run();
+        try {
+          await upd();
+        } catch (e) {
+          if (!/no such column:? ?alive|no column named alive/i.test(String(e && e.message))) throw e;
+          // 旧库还没有 alive 列：自动补上再重试（等价于执行 migrations/0004_alive.sql）；补不上就跳过 alive
+          try { await env.DB.prepare('ALTER TABLE nodes ADD COLUMN alive TEXT').run(); await upd(); }
+          catch { await env.DB.prepare(base + ' WHERE id=?').bind(...args, node.id).run(); }
+        }
+      }
     } catch (e) {
       if (/no such column/i.test(String(e && e.message))) {
         throw new HttpError(500, '数据库结构过旧，请执行 migrations/0001_stun_paths.sql');
@@ -537,6 +572,7 @@ async function handleAgent(request, env, url) {
     const { results: peers } = await env.DB.prepare(
       'SELECT * FROM nodes WHERE network_id=? AND id!=? AND enabled=1 AND public_key IS NOT NULL ORDER BY id'
     ).bind(node.network_id, node.id).all();
+    markObserved([node, ...peers], t);
     return textResp(buildConfig(node, node, peers, t, { pathCapable: request.headers.get('X-Meshlink-Path') === '1' }));
   }
 
@@ -653,6 +689,7 @@ async function handleAdmin(request, env, url) {
     const id = Number(m[1]);
     if (method === 'GET') {
       const { results } = await env.DB.prepare('SELECT * FROM nodes WHERE network_id=? ORDER BY id').bind(id).all();
+      markObserved(results, t);
       return jsonResp({ nodes: results.map((n) => publicNode(n, t)) });
     }
     if (method === 'POST') {
@@ -713,6 +750,7 @@ async function handleAdmin(request, env, url) {
     // 清掉旧的 STUN/路径数据（未执行迁移时列不存在，忽略即可）
     await env.DB.prepare('UPDATE nodes SET stun_endpoint=NULL, stun_at=NULL, nat_type=NULL, paths=NULL WHERE id=?')
       .bind(Number(m[1])).run().catch(() => {});
+    await env.DB.prepare('UPDATE nodes SET alive=NULL WHERE id=?').bind(Number(m[1])).run().catch(() => {});
     return jsonResp({ ok: true, enroll_token: token });
   }
 

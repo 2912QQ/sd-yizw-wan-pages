@@ -121,6 +121,48 @@ test('report: 输入校验', async () => {
   assert.equal(await bad({ stun: '1.2.3.4:80', nat: 'public', paths: '' }), 200);
 });
 
+test('report: paths 可附带往返延迟，旧格式仍然兼容', async () => {
+  const { env, cookie, net, nodes } = await setup();
+  const rep = (paths) => call(env, 'POST', '/api/agent/report', { bearer: nodes.alice.secret, form: { stun: '203.0.113.60:5555', nat: 'cone', paths } });
+  assert.equal((await rep(`${nodes.bob.id}:d:23,${nodes.hub1.id}:r:140`)).status, 200);
+  const list = (await call(env, 'GET', `/api/admin/networks/${net}/nodes`, { cookie })).json.nodes;
+  assert.deepEqual(list.find((n) => n.id === nodes.alice.id).paths, [
+    { peer_id: nodes.bob.id, state: 'd', rtt: 23 },
+    { peer_id: nodes.hub1.id, state: 'r', rtt: 140 },
+  ]);
+  assert.equal((await rep(`${nodes.bob.id}:d,${nodes.hub1.id}:p`)).status, 200);     // 旧 agent 的格式
+  const old = (await call(env, 'GET', `/api/admin/networks/${net}/nodes`, { cookie })).json.nodes.find((n) => n.id === nodes.alice.id);
+  assert.deepEqual(old.paths, [{ peer_id: nodes.bob.id, state: 'd' }, { peer_id: nodes.hub1.id, state: 'p' }]);
+  for (const bad of ['1:d:', '1:d:abc', '1:d:123456', '1:x:5', '1:d:5:6']) assert.equal((await rep(bad)).status, 400, bad);
+});
+
+test('在线: agent 没同步控制面，但在线节点报告与它有新鲜握手时显示在线（仅隧道）', async () => {
+  const { env, cookie, net, nodes } = await setup();
+  await sync(env, nodes.hub1, '198.51.100.1');
+  await sync(env, nodes.alice, '203.0.113.60');
+  // bob 从没同步过（或同步早就断了）: 离线
+  const get = async () => (await call(env, 'GET', `/api/admin/networks/${net}/nodes`, { cookie })).json.nodes.find((n) => n.id === nodes.bob.id);
+  env.db.exec(`UPDATE nodes SET last_seen = ${Math.floor(Date.now() / 1000) - 3600} WHERE id = ${nodes.bob.id}`);
+  assert.equal((await get()).online, false);
+  // 在线的 hub 报告和 bob 有新鲜握手
+  const rep = (node, alive) => call(env, 'POST', '/api/agent/report', { bearer: node.secret, form: { stun: '', nat: 'public', paths: '', alive } });
+  assert.equal((await rep(nodes.hub1, String(nodes.bob.id))).status, 200);
+  const b = await get();
+  assert.equal(b.online, true); assert.equal(b.observed, true);
+  // 其他节点的配置里也把 bob 当成在线（路径管理器不会把它当离线对端）
+  const cfg = (await sync(env, nodes.alice, '203.0.113.60')).text;
+  assert.match(peerBlock(cfg, 'bob'), /hub=0 online=1/);
+  // 握手消失 -> 又变回离线
+  await rep(nodes.hub1, '');
+  assert.equal((await get()).online, false);
+  // 报告者自己离线时，它的 alive 不可信
+  await rep(nodes.hub1, String(nodes.bob.id));
+  env.db.exec(`UPDATE nodes SET last_seen = ${Math.floor(Date.now() / 1000) - 3600} WHERE id = ${nodes.hub1.id}`);
+  assert.equal((await get()).online, false);
+  // 格式校验；不带 alive 的旧 agent 不会清掉已有值
+  assert.equal((await rep(nodes.alice, '1;DROP')).status, 400);
+});
+
 test('report: 需要节点凭证；禁用的节点被拒绝', async () => {
   const { env, cookie, nodes } = await setup();
   assert.equal((await call(env, 'POST', '/api/agent/report', { form: { stun: '1.2.3.4:80', nat: 'cone' } })).status, 401);
