@@ -31,7 +31,7 @@ label.inline{display:flex;gap:8px;align-items:center;color:var(--text)}
 .btn.danger:hover{background:rgba(248,113,113,.12);border-color:var(--bad)}
 td.actions .btn.pri{background:rgba(77,141,255,.16);border-color:var(--pri);color:#d4e6ff;box-shadow:none}
 .err{color:var(--bad);margin:0;min-height:1em;font-size:13px}
-.wrap{max-width:1180px;margin:0 auto;padding:16px;display:grid;gap:14px}
+.wrap{max-width:1180px;margin:0 auto;padding:16px;display:grid;grid-template-columns:minmax(0,1fr);gap:14px}
 .hero{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;padding:20px 24px}
 .hero h1{margin:0;font-size:26px;line-height:1.25;display:flex;align-items:center;gap:10px;flex-wrap:wrap}
 .hero p{margin:4px 0 0}
@@ -46,18 +46,20 @@ td.actions .btn.pri{background:rgba(77,141,255,.16);border-color:var(--pri);colo
 .net small{color:inherit;opacity:.7;font-size:12px}
 .net .cnt{margin-left:8px;font-size:12px;font-weight:400;opacity:.75}
 #netList .empty{padding:4px 0}
-#detail{display:grid;gap:14px;align-content:start;min-width:0}
+#detail{display:grid;grid-template-columns:minmax(0,1fr);gap:14px;align-content:start;min-width:0}
 .panel{padding:18px 20px}
 .head{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap}
 .head h2{margin:0;font-size:19px}
 .actions{display:flex;gap:6px;flex-wrap:wrap}
+td.actions{display:table-cell;min-width:184px;width:184px;white-space:normal;vertical-align:middle}
+td.actions .btn{margin:3px 4px 3px 0}
 .stats{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}
 .stat{padding:16px 18px}
 .stat .n{font-size:30px;font-weight:700;line-height:1.25}
 .stat .sub{font-size:12px;color:var(--muted)}
 .tbl-wrap{overflow-x:auto}
 table{width:100%;border-collapse:separate;border-spacing:0;min-width:900px}
-th,td{text-align:left;padding:12px 10px;border-bottom:1px solid #15233b;white-space:nowrap}
+th,td{text-align:left;padding:12px 8px;border-bottom:1px solid #15233b;white-space:nowrap}
 th{font-size:12.5px;color:var(--muted);font-weight:600;background:#0f192c}
 th:first-child{border-radius:10px 0 0 10px}th:last-child{border-radius:0 10px 10px 0}
 tbody tr:hover td{background:rgba(77,141,255,.07)}
@@ -72,6 +74,9 @@ tr:last-child td{border-bottom:0}
 .tag{font-size:11px;padding:1px 8px;border-radius:99px;background:rgba(77,141,255,.16);border:1px solid rgba(77,141,255,.4);color:#a9ccff;margin-left:6px}
 .notice{padding:11px 16px;border-radius:12px;border:1px solid rgba(251,191,36,.4);background:rgba(251,191,36,.07);color:var(--warn);font-size:13px}
 .geo{font:12px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;color:var(--muted);margin-top:1px}
+#qr{background:#fff;padding:10px;border-radius:8px;width:min(100%,262px);aspect-ratio:1/1;margin:4px auto;display:grid;place-items:center;overflow:hidden}
+#qr canvas{display:none!important}
+#qr img{display:block!important;width:100%!important;height:auto!important;aspect-ratio:1/1;image-rendering:pixelated}
 .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:13px}
 .empty{padding:48px 16px;text-align:center;color:var(--muted)}
 dialog{border:1px solid var(--line2);border-radius:18px;background:#0b1424;color:var(--text);padding:0;width:min(92vw,540px);box-shadow:0 20px 60px rgba(0,0,0,.6)}
@@ -102,7 +107,7 @@ pre{margin:0;background:var(--code);color:var(--code-t);padding:12px;border:1px 
   <div class="wrap">
     <header class="card hero">
       <div>
-        <h1>龍哥Link 控制台 <span class="pill">v2.4.1</span></h1>
+        <h1>龍哥Link 控制台 <span class="pill">v2.5.0</span></h1>
         <p class="muted"><span id="subtitle"></span> <button class="btn sm ghost" id="editSub" title="自定义这段说明文字">✎ 编辑</button></p>
       </div>
       <button class="btn pill-btn" id="logout">退出登录</button>
@@ -525,7 +530,7 @@ function showClientConf(name, info, conf) {
     <h3>“${esc(name)}”的接入配置</h3>
     <p class="muted" style="margin:0">手机：打开官方 WireGuard App → “+” → 扫描二维码。电脑：在 WireGuard 里“导入隧道”选择下载的 .conf 文件。
     <b>私钥只在这里显示这一次</b>（服务器不保存），关闭后如需重装请点“重新生成配置”。</p>
-    <div id="qr" style="background:#fff;padding:10px;border-radius:8px;width:max-content;max-width:100%;margin:4px auto"></div>
+    <div id="qr"></div>
     <pre id="cmd">${esc(conf)}</pre>
     <p class="muted" style="margin:0">虚拟 IP: <span class="mono">${esc(info.ip)}</span> · 接入 Hub: ${esc(info.hub_name)} (${esc(info.endpoint)})</p>
     <div class="row end"><button class="btn" id="cp">复制配置</button><button class="btn" id="dl">下载 ${esc(file)}</button><button class="btn pri" data-close>完成</button></div></div>`;
