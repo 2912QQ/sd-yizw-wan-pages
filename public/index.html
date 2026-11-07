@@ -74,6 +74,7 @@ tr:last-child td{border-bottom:0}
 dialog{border:1px solid var(--line2);border-radius:18px;background:#0b1424;color:var(--text);padding:0;width:min(92vw,540px);box-shadow:0 20px 60px rgba(0,0,0,.6)}
 dialog::backdrop{background:rgba(2,6,14,.72);backdrop-filter:blur(3px)}
 dialog form,dialog .box{padding:22px;display:grid;gap:12px}
+dialog .box{max-height:88vh;overflow-y:auto}
 dialog h3{margin:0;font-size:18px}
 .row{display:flex;gap:8px}.row.end{justify-content:flex-end}
 pre{margin:0;background:var(--code);color:var(--code-t);padding:12px;border:1px solid var(--line);border-radius:10px;overflow-x:auto;white-space:pre-wrap;word-break:break-all;font-size:12.5px}
@@ -285,7 +286,7 @@ function renderDetail() {
           <td class="mono">${esc(n.subnets || '-')}</td>
           <td>${n.registered && !n.is_client ? ago(n.last_seen) : '-'}</td>
           <td class="actions" data-id="${n.id}">
-            ${n.enroll_token ? '<button class="btn sm pri" data-a="install">安装命令</button>' : ''}
+            ${n.is_client ? '' : `<button class="btn sm ${n.enroll_token ? 'pri' : ''}" data-a="install">${n.enroll_token ? '安装命令' : '命令'}</button>`}
             ${n.is_client ? '<button class="btn sm pri" data-a="regen">重新生成配置</button>' : '<button class="btn sm" data-a="editNode">编辑</button>'}
             <button class="btn sm" data-a="toggle">${n.enabled ? '禁用' : '启用'}</button>
             ${n.is_client ? '' : '<button class="btn sm" data-a="reset">重置</button>'}
@@ -378,50 +379,54 @@ function nodeForm(node) {
 }
 
 function showInstall(node) {
-  if (!node || !node.enroll_token) return;
+  if (!node || node.is_client) return;
   const o = location.origin;
-  const linuxCmd = `curl -fsSL ${o}/agent.sh | sudo bash -s -- install --server ${o} --token ${node.enroll_token}`;
-  // Docker（iStoreOS / OpenWrt / 任意带 Docker 的设备）：与仓库里的 docker-compose.yml 等价的一条命令
-  const dockerCmd = `docker run -d --name meshlink --restart unless-stopped \\\n`
-    + `  --network host --cap-add NET_ADMIN \\\n`
-    + `  -e SERVER=${o} -e TOKEN=${node.enroll_token} \\\n`
-    + `  -v /opt/meshlink:/etc/meshlink \\\n`
-    + `  debian:bookworm-slim bash -c 'sed -i "s/deb.debian.org/mirrors.ustc.edu.cn/g" /etc/apt/sources.list.d/*\n`
-    + `command -v curl >/dev/null || { apt-get update && apt-get install -y curl ca-certificates; }\n`
-    + `curl -fsSL --retry 5 --retry-all-errors $SERVER/agent.sh -o /tmp/a.sh && bash /tmp/a.sh container'`;
-  const tabs = {
-    linux: {
-      cmd: linuxCmd,
-      help: '在该节点的 Linux 机器上以 root 执行下面的命令（需要 systemd；会自动安装 wireguard-tools）。令牌一次性有效。',
-    },
-    docker: {
-      cmd: dockerCmd,
-      help: '适用于 iStoreOS / OpenWrt / 任何带 Docker 的设备：通过 SSH 登录设备后粘贴执行。前提：主机内核已有 WireGuard 模块（执行 <span class="mono">lsmod | grep wireguard</span> 能看到；没有就先 <span class="mono">opkg update &amp;&amp; opkg install kmod-wireguard</span>）。令牌一次性有效，凭证保存在 <span class="mono">/opt/meshlink</span>（可改成其他持久化目录）。软件包默认走中科大镜像（国内更快；境外可把命令里的 mirrors.ustc.edu.cn 换成 deb.debian.org）。重新安装前请先 <span class="mono">docker rm -f meshlink &amp;&amp; rm -rf /opt/meshlink</span>。',
-    },
-  };
-  let cur = 'linux';
+  const pending = !!node.enroll_token;
+  const blocks = [];
+  if (pending) {
+    blocks.push({
+      title: '① 安装 — Linux (systemd)',
+      help: '在该节点的 Linux 机器上以 root 执行（需要 systemd；会自动安装 wireguard-tools）。令牌一次性有效。',
+      cmd: `curl -fsSL ${o}/agent.sh | sudo bash -s -- install --server ${o} --token ${node.enroll_token}`,
+    });
+    blocks.push({
+      title: '② 安装 — Docker / iStoreOS',
+      help: 'iStoreOS / OpenWrt / 任何带 Docker 的设备，SSH 登录后粘贴执行。前提：主机内核有 WireGuard 模块（<span class="mono">lsmod | grep wireguard</span>；没有就 <span class="mono">opkg install kmod-wireguard</span>）。软件包默认走中科大镜像，境外可把 mirrors.ustc.edu.cn 换成 deb.debian.org。凭证保存在 /opt/meshlink。重装前先执行下方 Docker 卸载命令。',
+      cmd: `docker run -d --name meshlink --restart unless-stopped \\\n`
+        + `  --network host --cap-add NET_ADMIN \\\n`
+        + `  -e SERVER=${o} -e TOKEN=${node.enroll_token} \\\n`
+        + `  -v /opt/meshlink:/etc/meshlink \\\n`
+        + `  debian:bookworm-slim bash -c 'sed -i "s/deb.debian.org/mirrors.ustc.edu.cn/g" /etc/apt/sources.list.d/*\n`
+        + `command -v curl >/dev/null || { apt-get update && apt-get install -y curl ca-certificates; }\n`
+        + `curl -fsSL --retry 5 --retry-all-errors $SERVER/agent.sh -o /tmp/a.sh && bash /tmp/a.sh container'`,
+    });
+  }
+  blocks.push({
+    title: (pending ? '③' : '①') + ' 管理 — Linux (systemd)',
+    help: '节点安装后的常用命令（在节点机器上以 root 执行）。',
+    cmd: '# 查看状态（含 NAT 类型、各对端直连/中转）\nmeshlink-agent status\n# 立即同步一次配置 / 单次 STUN 探测\nmeshlink-agent sync\nmeshlink-agent stun\n# 查看日志\njournalctl -u meshlink-agent -f\n# 升级 agent（控制面更新后执行一次）\ncurl -fsSL ' + o + '/agent.sh | sudo bash -s -- upgrade\n# 卸载（之后记得在后台删除该节点）\nmeshlink-agent uninstall',
+  });
+  blocks.push({
+    title: (pending ? '④' : '②') + ' 管理 — Docker / iStoreOS',
+    help: '节点装在 Docker 里时用这些命令。',
+    cmd: '# 查看日志（装依赖、注册、运行情况）\ndocker logs -f meshlink\n# 查看状态（含 NAT 类型、各对端直连/中转）\ndocker exec meshlink meshlink-agent status\n# 单次 STUN 探测\ndocker exec meshlink meshlink-agent stun\n# 重启（同时会重新下载最新版 agent，相当于升级）\ndocker restart meshlink\n# 卸载 / 重装前清理（之后记得在后台删除该节点）\ndocker rm -f meshlink && rm -rf /opt/meshlink',
+  });
   const d = $('#dlg');
   d.innerHTML = `<div class="box">
-    <h3>安装节点“${esc(node.name)}”</h3>
-    <div class="row" id="tabs">
-      <button class="btn sm pri" data-tab="linux">Linux (systemd)</button>
-      <button class="btn sm" data-tab="docker">Docker / iStoreOS</button>
-    </div>
-    <p class="muted" style="margin:0" id="help"></p>
-    <pre id="cmd"></pre>
-    <p class="muted" style="margin:0">虚拟 IP: <span class="mono">${esc(node.ip)}</span></p>
-    <div class="row end"><button class="btn" id="cp">复制命令</button><button class="btn pri" data-close>完成</button></div></div>`;
-  const render = () => {
-    d.querySelector('#help').innerHTML = tabs[cur].help;
-    d.querySelector('#cmd').textContent = tabs[cur].cmd;
-    d.querySelectorAll('[data-tab]').forEach((b) => b.classList.toggle('pri', b.dataset.tab === cur));
-  };
-  d.querySelectorAll('[data-tab]').forEach((b) => { b.onclick = () => { cur = b.dataset.tab; render(); }; });
-  d.querySelector('#cp').onclick = async () => {
-    try { await navigator.clipboard.writeText(tabs[cur].cmd); toast('已复制'); } catch { toast('请手动选中复制'); }
-  };
+    <h3>${pending ? '安装节点' : '节点命令'}“${esc(node.name)}”</h3>
+    <p class="muted" style="margin:0">虚拟 IP: <span class="mono">${esc(node.ip)}</span>${pending ? '' : '　（节点已注册，安装令牌已失效；需要重新安装请先在列表里点“重置”）'}</p>
+    ${blocks.map((x, i) => `<div style="display:grid;gap:6px">
+      <div class="row" style="align-items:center;justify-content:space-between"><b>${x.title}</b><button class="btn sm" data-copy="${i}">复制</button></div>
+      <p class="muted" style="margin:0;font-size:12.5px">${x.help}</p>
+      <pre data-pre="${i}"></pre></div>`).join('')}
+    <div class="row end"><button class="btn pri" data-close>完成</button></div></div>`;
+  blocks.forEach((x, i) => { d.querySelector(`[data-pre="${i}"]`).textContent = x.cmd; });
+  d.querySelectorAll('[data-copy]').forEach((btn) => {
+    btn.onclick = async () => {
+      try { await navigator.clipboard.writeText(blocks[Number(btn.dataset.copy)].cmd); toast('已复制'); } catch { toast('请手动选中复制'); }
+    };
+  });
   d.querySelector('[data-close]').onclick = () => d.close();
-  render();
   if (!d.open) d.showModal();
 }
 
