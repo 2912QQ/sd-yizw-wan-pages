@@ -367,7 +367,7 @@ function nodeCard(n, net) {
     </div>`;
   const btns = n.is_client
     ? '<button class="btn sm pri" data-a="regen">重新生成配置</button><button class="btn sm" data-a="editClient">编辑</button><button class="btn sm danger" data-a="delNode">删除</button>'
-    : `<button class="btn sm ${n.enroll_token ? 'pri' : ''}" data-a="install">${n.enroll_token ? '安装命令' : '命令'}</button><button class="btn sm" data-a="editNode">编辑</button><button class="btn sm" data-a="reset">重置</button><button class="btn sm danger" data-a="delNode">删除</button>`;
+    : `<button class="btn sm ${n.enroll_token ? 'pri' : ''}" data-a="install">${n.enroll_token ? '安装命令' : '命令'}</button><button class="btn sm" data-a="editNode">编辑</button><button class="btn sm ${n.exit_via ? 'pri' : ''}" data-a="exitNode" title="选择该节点的全部外网流量经哪个节点出去（出口 IP）">${n.exit_via ? '出口 IP ✓' : '出口 IP'}</button><button class="btn sm" data-a="reset">重置</button><button class="btn sm danger" data-a="delNode">删除</button>`;
   return `<article class="node ${st} ${n.enabled ? '' : 'off'}" data-id="${n.id}">
     <div class="nh">
       <div class="nid">
@@ -402,6 +402,7 @@ $('#detail').onclick = async (e) => {
     }
     else if (a === 'install') showInstall(node);
     else if (a === 'editNode') nodeForm(node);
+    else if (a === 'exitNode') exitForm(node);
     else if (a === 'editClient') clientEditForm(node);
     else if (a === 'allOn' || a === 'allOff') {
       const on = a === 'allOn';
@@ -487,6 +488,19 @@ function exitField(node) {
   return `<label>出口节点（可选：该节点的全部外网流量经它出去，对外 IP 变成出口节点的公网 IP${hubOnly ? '；中心辐射网络只能选 Hub' : ''}）
       <select name="exit_via">${opts.join('')}</select></label>
     <div class="muted" style="font-size:12px">出口节点离线时会自动回退为本地出网；仅 IPv4。出口节点需要能转发（Linux 需 iptables，iStoreOS 需放行转发）。<b>使用方和出口节点的 agent 都要先升级</b>：<a href="#" data-upgrade style="color:var(--pri)">查看升级命令</a></div>`;
+}
+
+// 单独的“出口 IP”设置窗口（节点卡片上的“出口 IP”按钮）：选一个出口节点，该节点的全部外网流量经它出去
+function exitForm(node) {
+  if (!node || node.is_client) return;
+  const usedBy = nodes.filter((x) => x.exit_via === node.id);
+  if (usedBy.length) { toast(`“${node.name}”正被 ${usedBy.map((x) => x.name).join('、')} 用作出口节点，不能再选择别的出口`); return; }
+  openForm(`出口 IP —“${esc(node.name)}”`, exitField(node), async (f) => {
+    await api(`/nodes/${node.id}`, 'PUT', { exit_via: Number(f.get('exit_via') || 0) });
+    toast('已保存，约 1 分钟内生效'); await refresh();
+  }, '保存');
+  const upg = $('#dlg').querySelector('[data-upgrade]');
+  if (upg) upg.onclick = (e) => { e.preventDefault(); showUpgrade(); };
 }
 
 function nodeForm(node) {
