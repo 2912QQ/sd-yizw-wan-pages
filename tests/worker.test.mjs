@@ -514,3 +514,60 @@ test('运营商 / 归属地: IPINFO_DISABLED 时完全不查询', async () => {
   assert.equal(r.json.nodes.find((x) => x.id === nodes.alice.id).ipv4_info, null);
   assert.equal(n, 0);
 });
+
+test('手机/电脑在线状态: 主 Hub 的配置给客户端带 id 元信息；Hub 上报握手后客户端显示在线', async () => {
+  const { env, cookie, net, nodes } = await setup();
+  const sync = (n) => worker.fetch(new Request('https://mesh.example/api/agent/sync', {
+    method: 'POST', headers: { Authorization: `Bearer ${n.secret}`, 'CF-Connecting-IP': '203.0.113.20' },
+  }), env).then((x) => x.text());
+  await sync(nodes.hub1);                                     // Hub 先上线，才有对外地址可给手机
+  const r = await addClient(env, cookie, net, 'phone', 'P');
+  assert.equal(r.status, 201, r.text);
+  const cid = r.json.id;
+
+  const hubCfg = await sync(nodes.hub1);
+  assert.match(hubCfg, new RegExp(`# phone \\(client\\)\\n# meshlink peer id=${cid} hub=0 online=0 nat=unknown client=1\\nPublicKey`));
+  assert.doesNotMatch(await sync(nodes.alice), /client=1/);   // 只有主 Hub 把客户端当对端
+
+  const phone = async () => (await call(env, 'GET', `/api/admin/networks/${net}/nodes`, { cookie })).json.nodes.find((n) => n.id === cid);
+  assert.equal((await phone()).online, false);                // 没人报告过握手
+
+  const rep = await call(env, 'POST', '/api/agent/report', { bearer: nodes.hub1.secret, form: { nat: 'public', alive: String(cid) } });
+  assert.equal(rep.status, 200, rep.text);
+  assert.equal((await phone()).online, true);                 // Hub 报告和手机有新鲜握手
+
+  await call(env, 'POST', '/api/agent/report', { bearer: nodes.hub1.secret, form: { nat: 'public', alive: '' } });
+  assert.equal((await phone()).online, false);                // 握手过期后恢复“未连接”
+});
+
+test('一键启用/停用: 只改本网络的设备；参数必须是布尔值；需要登录；网络不存在返回 404', async () => {
+  const { env, cookie, net, nodes } = await setup();
+  const other = (await call(env, 'POST', '/api/admin/networks', { cookie, body: { name: 'other', cidr: '10.99.0.0/24' } })).json.id;
+  await call(env, 'POST', `/api/admin/networks/${other}/nodes`, { cookie, body: { name: 'x1' } });
+  const list = async (id) => (await call(env, 'GET', `/api/admin/networks/${id}/nodes`, { cookie })).json.nodes;
+
+  assert.equal((await call(env, 'PUT', `/api/admin/networks/${net}/enabled`, { body: { enabled: false } })).status, 401);
+  assert.equal((await call(env, 'PUT', `/api/admin/networks/${net}/enabled`, { cookie, body: { enabled: 'no' } })).status, 400);
+  assert.equal((await call(env, 'PUT', `/api/admin/networks/9999/enabled`, { cookie, body: { enabled: false } })).status, 404);
+
+  let r = await call(env, 'PUT', `/api/admin/networks/${net}/enabled`, { cookie, body: { enabled: false } });
+  assert.equal(r.status, 200);
+  assert.equal(r.json.changed, 3);
+  assert.ok((await list(net)).every((n) => n.enabled === false));
+  assert.ok((await list(other)).every((n) => n.enabled === true));      // 别的网络不受影响
+
+  r = await call(env, 'PUT', `/api/admin/networks/${net}/enabled`, { cookie, body: { enabled: true } });
+  assert.equal(r.json.changed, 3);
+  assert.ok((await list(net)).every((n) => n.enabled === true));
+  assert.equal((await call(env, 'PUT', `/api/admin/networks/${net}/enabled`, { cookie, body: { enabled: true } })).json.changed, 0);
+
+  // 手机/电脑的改名和改 IP 走同一个节点接口
+  const sync = (n) => worker.fetch(new Request('https://mesh.example/api/agent/sync', { method: 'POST', headers: { Authorization: `Bearer ${n.secret}`, 'CF-Connecting-IP': '203.0.113.20' } }), env);
+  await sync(nodes.hub1);
+  const c = (await addClient(env, cookie, net, 'phone', 'P')).json;
+  assert.equal((await call(env, 'PUT', `/api/admin/nodes/${c.id}`, { cookie, body: { name: 'my-phone', ip: '10.88.0.77' } })).status, 200);
+  const phone = (await list(net)).find((n) => n.id === c.id);
+  assert.equal(phone.name, 'my-phone');
+  assert.equal(phone.ip, '10.88.0.77');
+  assert.equal((await call(env, 'PUT', `/api/admin/nodes/${c.id}`, { cookie, body: { ip: '10.88.0.1' } })).status, 409);   // 与 hub1 等重复
+});

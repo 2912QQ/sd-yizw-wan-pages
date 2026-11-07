@@ -877,7 +877,8 @@ class Daemon:
                 item += ':' + fam
             return item
         self.paths_str = ','.join(path_item(p) for p in peers
-                                  if p['pub'] in plabels and p['meta'].get('id', '').isdigit())
+                                  if p['pub'] in plabels and p['meta'].get('id', '').isdigit()
+                                  and p['meta'].get('client') != '1')   # 手机/电脑只上报在线状态（alive），不进“路径”列
         # 和哪些对端有新鲜握手（含 Hub）：上报给控制面，这样即使对端的 agent 连不上控制面，后台也知道它的隧道还活着
         self.alive_str = ','.join(sorted(
             (p['meta']['id'] for p in peers if p['meta'].get('id', '').isdigit()

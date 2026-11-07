@@ -619,7 +619,10 @@ function buildConfig(self, net, allPeers, t, opts = {}) {
   }
   if (iAmPrimary) {
     for (const c of clients) {
-      L.push('', '[Peer]', `# ${c.name} (client)`, `PublicKey = ${c.public_key}`, `AllowedIPs = ${c.ip}/32`);
+      // 带上 id，主 Hub 上的路径管理器才会把“手机有没有新鲜握手”报告给控制面（client=1 只用于上报在线状态，不参与选路）
+      L.push('', '[Peer]', `# ${c.name} (client)`,
+        `# meshlink peer id=${c.id} hub=0 online=${isOnline(c, t) ? 1 : 0} nat=unknown client=1`,
+        `PublicKey = ${c.public_key}`, `AllowedIPs = ${c.ip}/32`);
     }
   }
   return L.join('\n') + '\n';
@@ -848,6 +851,17 @@ async function handleAdmin(request, env, url) {
       const nodeId = await createNode(env, id, await readJson(request));
       return jsonResp({ id: nodeId }, 201);
     }
+  }
+
+  // 一键启用 / 停用本网络的全部设备（节点 + 手机/电脑）
+  if ((m = path.match(/^\/networks\/(\d+)\/enabled$/)) && method === 'PUT') {
+    const id = Number(m[1]);
+    const b = await readJson(request);
+    if (typeof b.enabled !== 'boolean') throw new HttpError(400, 'enabled 必须是 true 或 false');
+    const net = await env.DB.prepare('SELECT id FROM networks WHERE id=?').bind(id).first();
+    if (!net) throw new HttpError(404, '网络不存在');
+    const r = await env.DB.prepare('UPDATE nodes SET enabled=? WHERE network_id=? AND enabled!=?').bind(b.enabled ? 1 : 0, id, b.enabled ? 1 : 0).run();
+    return jsonResp({ ok: true, changed: r.meta.changes });
   }
 
   if ((m = path.match(/^\/networks\/(\d+)\/clients$/)) && method === 'POST') {

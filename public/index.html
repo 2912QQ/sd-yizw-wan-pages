@@ -25,6 +25,7 @@ label.inline{display:flex;gap:8px;align-items:center;color:var(--text)}
 .btn:hover{border-color:var(--pri);background:rgba(77,141,255,.12)}
 .btn.pri{background:linear-gradient(180deg,#5b9bff,#3b6df0);border-color:transparent;color:#fff;box-shadow:0 4px 16px rgba(59,109,240,.35)}
 .btn.pri:hover{filter:brightness(1.08)}
+.btn:disabled{opacity:.4;cursor:not-allowed;pointer-events:none}
 .btn.ghost{background:transparent;color:var(--text)}
 .btn.sm{padding:5px 12px;font-size:12.5px;border-radius:8px}
 .btn.danger{color:var(--bad);border-color:rgba(248,113,113,.38)}
@@ -47,19 +48,25 @@ td.actions .btn.pri{background:rgba(77,141,255,.16);border-color:var(--pri);colo
 .net .cnt{margin-left:8px;font-size:12px;font-weight:400;opacity:.75}
 #netList .empty{padding:4px 0}
 #detail{display:grid;grid-template-columns:minmax(0,1fr);gap:14px;align-content:start;min-width:0}
-.panel{padding:18px 20px}
+.panel{padding:18px 14px}
 .head{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap}
 .head h2{margin:0;font-size:19px}
 .actions{display:flex;gap:6px;flex-wrap:wrap}
-td.actions{display:table-cell;min-width:184px;width:184px;white-space:normal;vertical-align:middle}
-td.actions .btn{margin:3px 4px 3px 0}
+td.actions{display:table-cell;vertical-align:middle}
+.acts{display:grid;grid-template-columns:repeat(2,max-content);gap:6px}
+.acts .full{grid-column:1/-1}
+.sw{position:relative;width:38px;height:22px;padding:0;border:1px solid var(--line2);border-radius:99px;background:#16233b;cursor:pointer;vertical-align:middle;transition:background .15s,border-color .15s}
+.sw i{position:absolute;top:2px;left:2px;width:16px;height:16px;border-radius:50%;background:#8794ad;transition:transform .15s,background .15s}
+.sw.on{background:rgba(52,211,153,.22);border-color:var(--ok)}
+.sw.on i{transform:translateX(16px);background:var(--ok)}
+.sw:focus-visible{outline:2px solid var(--pri);outline-offset:2px}
 .stats{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}
 .stat{padding:16px 18px}
 .stat .n{font-size:30px;font-weight:700;line-height:1.25}
 .stat .sub{font-size:12px;color:var(--muted)}
 .tbl-wrap{overflow-x:auto}
 table{width:100%;border-collapse:separate;border-spacing:0;min-width:900px}
-th,td{text-align:left;padding:12px 8px;border-bottom:1px solid #15233b;white-space:nowrap}
+th,td{text-align:left;padding:12px 6px;border-bottom:1px solid #15233b;white-space:nowrap}
 th{font-size:12.5px;color:var(--muted);font-weight:600;background:#0f192c}
 th:first-child{border-radius:10px 0 0 10px}th:last-child{border-radius:0 10px 10px 0}
 tbody tr:hover td{background:rgba(77,141,255,.07)}
@@ -228,7 +235,11 @@ $('#netList').onclick = (e) => {
 
 function statusBadge(n) {
   if (!n.enabled) return '<span class="badge b-bad"><i></i>已禁用</span>';
-  if (n.is_client) return '<span class="badge"><i></i>客户端</span>';
+  if (n.is_client) {
+    return n.online
+      ? '<span class="badge b-ok" title="Hub 与该设备有新鲜的 WireGuard 握手"><i></i>客户端 · 已连接</span>'
+      : '<span class="badge" title="Hub 上最近 3 分钟没有和该设备握手（手机没开隧道、或已休眠）"><i></i>客户端 · 未连接</span>';
+  }
   if (!n.registered) return '<span class="badge b-warn"><i></i>待安装</span>';
   if (n.online && n.observed) {
     return '<span class="badge b-ok" title="该节点的 agent 没有同步控制面（可能连不上控制面域名，或 agent 已停止），但其他节点能和它建立 WireGuard 握手，隧道可用。请在该节点执行 meshlink-agent status 排查。"><i></i>在线<span class="muted">（仅隧道）</span></span>';
@@ -287,6 +298,8 @@ function renderDetail() {
       <div class="actions">
         <button class="btn sm" data-a="addNode">＋ 添加节点</button>
         <button class="btn sm" data-a="addClient">＋ 添加手机/电脑</button>
+        <button class="btn sm" data-a="allOn" ${nodes.length && nodes.every((n) => n.enabled) ? 'disabled' : ''} title="启用本网络的全部节点和手机/电脑">全部启用</button>
+        <button class="btn sm" data-a="allOff" ${nodes.some((n) => n.enabled) ? '' : 'disabled'} title="停用本网络的全部节点和手机/电脑">全部停用</button>
         <button class="btn sm" data-a="editNet">编辑网络</button>
         <button class="btn sm danger" data-a="delNet">删除网络</button>
       </div>
@@ -300,7 +313,7 @@ function renderDetail() {
     </div>
     <div class="card panel">
       ${nodes.length ? `<div class="tbl-wrap"><table>
-        <thead><tr><th>节点</th><th>虚拟 IP</th><th>状态</th><th>公网端点</th><th>NAT / 路径</th><th>内网网段</th><th>最后在线</th><th></th></tr></thead>
+        <thead><tr><th>节点</th><th>虚拟 IP</th><th>状态</th><th>公网端点</th><th>NAT / 路径</th><th>内网网段</th><th>最后在线</th><th>启用</th><th></th></tr></thead>
         <tbody>${nodes.map((n) => `<tr>
           <td><b>${esc(n.name)}</b>${n.is_hub ? '<span class="tag">Hub</span>' : ''}${n.is_client ? '<span class="tag">手机/电脑</span>' : ''}</td>
           <td class="mono">${esc(n.ip)}</td>
@@ -309,13 +322,13 @@ function renderDetail() {
           <td>${n.is_client ? '-' : pathCell(n, net)}</td>
           <td class="mono">${esc(n.subnets || '-')}</td>
           <td>${n.registered && !n.is_client ? ago(n.last_seen) : '-'}</td>
-          <td class="actions" data-id="${n.id}">
+          <td data-id="${n.id}"><button class="sw ${n.enabled ? 'on' : ''}" role="switch" aria-checked="${n.enabled}" data-a="toggle" title="${n.enabled ? '点击停用' : '点击启用'}"><i></i></button></td>
+          <td class="actions" data-id="${n.id}"><div class="acts">
             ${n.is_client ? '' : `<button class="btn sm ${n.enroll_token ? 'pri' : ''}" data-a="install">${n.enroll_token ? '安装命令' : '命令'}</button>`}
-            ${n.is_client ? '<button class="btn sm pri" data-a="regen">重新生成配置</button>' : '<button class="btn sm" data-a="editNode">编辑</button>'}
-            <button class="btn sm" data-a="toggle">${n.enabled ? '禁用' : '启用'}</button>
+            ${n.is_client ? '<button class="btn sm pri full" data-a="regen">重新生成配置</button><button class="btn sm" data-a="editClient">编辑</button>' : '<button class="btn sm" data-a="editNode">编辑</button>'}
             ${n.is_client ? '' : '<button class="btn sm" data-a="reset">重置</button>'}
             <button class="btn sm danger" data-a="delNode">删除</button>
-          </td></tr>`).join('')}</tbody></table></div>`
+          </div></td></tr>`).join('')}</tbody></table></div>`
         : '<div class="empty">还没有节点，点击“添加节点”开始组网</div>'}
     </div>`;
 }
@@ -338,6 +351,13 @@ $('#detail').onclick = async (e) => {
     }
     else if (a === 'install') showInstall(node);
     else if (a === 'editNode') nodeForm(node);
+    else if (a === 'editClient') clientEditForm(node);
+    else if (a === 'allOn' || a === 'allOff') {
+      const on = a === 'allOn';
+      if (!on && !confirm(`停用“${net.name}”的全部 ${nodes.filter((n) => n.enabled).length} 台设备（含 Hub 和手机/电脑）？它们会立即从组网配置里移除，隧道在各节点下一次同步（≤ 1 分钟）后断开。可随时再点“全部启用”恢复。`)) return;
+      const r = await api(`/networks/${net.id}/enabled`, 'PUT', { enabled: on });
+      toast(on ? `已启用 ${r.changed} 台设备` : `已停用 ${r.changed} 台设备`); await refresh();
+    }
     else if (a === 'toggle') { await api(`/nodes/${nodeId}`, 'PUT', { enabled: !node.enabled }); await refresh(); }
     else if (a === 'reset') {
       if (confirm(`重置“${node.name}”？旧凭证立即失效，节点会断开，需用新命令重新安装。`)) {
@@ -561,8 +581,26 @@ function clientForm() {
   }, '生成配置');
 }
 
-async function regenClient(node) {
-  if (!confirm(`重新生成“${node.name}”的配置？旧配置（旧密钥）立即失效，设备需要导入新配置。`)) return;
+function clientEditForm(node) {
+  openForm('编辑手机/电脑', `
+    <label>设备名称<input name="name" value="${esc(node.name)}" required maxlength="40"></label>
+    <label>虚拟 IP（修改后手机里的配置必须更新，保存后会提示重新生成；不能与其他设备重复）<input name="ip" class="mono" value="${esc(node.ip)}"></label>`, async (f) => {
+    const name = (f.get('name') || '').trim(), ip = (f.get('ip') || '').trim();
+    if (name === node.name && ip === node.ip) return;
+    await api(`/nodes/${node.id}`, 'PUT', { name, ip });
+    toast('已保存'); await refresh();
+    if (ip !== node.ip) {
+      setTimeout(async () => {
+        if (confirm(`“${name}”的虚拟 IP 已改为 ${ip}。手机/电脑里旧配置的地址已经对不上，需要重新生成配置并重新导入。现在生成？`)) {
+          try { await regenClient(nodes.find((n) => n.id === node.id), true); } catch (err) { toast(err.message); }
+        }
+      }, 50);
+    }
+  });
+}
+
+async function regenClient(node, skipConfirm) {
+  if (!skipConfirm && !confirm(`重新生成“${node.name}”的配置？旧配置（旧密钥）立即失效，设备需要导入新配置。`)) return;
   const kp = genKeyPair();
   const info = await api(`/nodes/${node.id}/client`, 'PUT', { public_key: kp.pub });
   await refresh();
