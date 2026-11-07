@@ -2,6 +2,7 @@
 # MeshLink agent — 在 Linux 节点上运行的客户端
 #
 # 安装:  curl -fsSL https://<你的域名>/agent.sh | sudo bash -s -- install --server https://<你的域名> --token <令牌>
+# Docker: 见后台“添加节点”里的 Docker / iStoreOS 标签
 # 其他:  meshlink-agent status | sync | stun | upgrade | uninstall
 #
 # 私钥只在本机生成并保存在 /etc/meshlink/private.key，不会上传。
@@ -289,11 +290,36 @@ cmd_uninstall() {
   log "已卸载（请记得在管理后台删除该节点）"
 }
 
+# 容器模式（iStoreOS / OpenWrt 的 Docker）：装依赖 → 首次注册（之后复用 /etc/meshlink 里的凭证）→ 前台运行
+# 需要环境变量 SERVER、TOKEN；由 docker run 的短命令通过 curl | bash -s -- container 调用
+cmd_container() {
+  need_root
+  : "${SERVER:?缺少环境变量 SERVER}"
+  SERVER="${SERVER%/}"
+  export DEBIAN_FRONTEND=noninteractive
+  if ! command -v wg-quick >/dev/null 2>&1; then
+    apt-get update && apt-get install -y --no-install-recommends wireguard-tools iproute2 iptables procps python3 curl ca-certificates hostname </dev/null \
+      || die "依赖安装失败（容器需要能访问 Debian 软件源）"
+  fi
+  if [ ! -f "$ENV_FILE" ]; then
+    : "${TOKEN:?缺少环境变量 TOKEN}"
+    cmd_install --server "$SERVER" --token "$TOKEN"
+  else
+    # 容器被重建过：凭证还在，只需把 agent 程序重新下载回来
+    curl -fsSL --max-time 30 "$SERVER/agent.sh" -o "$BIN" || die "下载 agent 失败"
+    chmod 755 "$BIN"
+    have_python || ensure_python
+    fetch_helper "$SERVER"
+  fi
+  exec "$BIN" run
+}
+
 main() {
   local cmd="${1:-}"
   [ $# -gt 0 ] && shift
   case "$cmd" in
     install) cmd_install "$@" ;;
+    container) cmd_container ;;
     run) cmd_run ;;
     sync) need_root; load_env; do_sync ;;
     status) cmd_status ;;
