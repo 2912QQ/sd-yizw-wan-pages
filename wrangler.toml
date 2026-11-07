@@ -1,5 +1,5 @@
 # Cloudflare Pages 项目配置（有 pages_build_output_dir 的 wrangler.toml 会被识别为 Pages 配置）
-name = "meshlink"
+name = "sd-yizw-wan-pages"
 compatibility_date = "2025-11-01"
 
 # 构建输出目录：管理后台前端、节点安装脚本、_worker.js（后端）、_routes.json 都在这里，无需构建步骤
@@ -8,8 +8,8 @@ pages_build_output_dir = "./public"
 # 先执行: npx wrangler d1 create meshlink ，然后把输出的 database_id 填到这里
 [[d1_databases]]
 binding = "DB"
-database_name = "meshlink"
-database_id = "REPLACE_WITH_YOUR_D1_DATABASE_ID"
+database_name = "sd-wan"
+database_id = "c1008b0a-205b-4fcf-835b-f25a3c8404f2"
 
 # 机密变量请用 wrangler pages secret 设置，不要写在这里:
 #   npx wrangler pages secret put ADMIN_PASSWORD --project-name meshlink
