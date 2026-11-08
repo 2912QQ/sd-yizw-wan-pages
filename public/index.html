@@ -117,7 +117,8 @@ pre{margin:0;background:var(--code);color:var(--code-t);padding:12px;border:1px 
 <div id="login" class="center" hidden>
   <form class="card login" id="loginForm">
     <h1>龍哥 SD-WAN</h1>
-    <p class="muted" style="margin:0">输入管理员密码登录控制台</p>
+    <p class="muted" style="margin:0">输入管理员账号登录控制台</p>
+    <input type="text" id="un" placeholder="用户名" autocomplete="username" autocapitalize="none" spellcheck="false" required>
     <input type="password" id="pw" placeholder="管理员密码" autocomplete="current-password" required>
     <button class="btn pri" type="submit">登录</button>
     <p class="err" id="loginErr"></p>
@@ -178,14 +179,14 @@ function ago(ts) {
   return Math.floor(d / 86400) + ' 天前';
 }
 
-function showLogin() { clearInterval(timer); $('#app').hidden = true; $('#login').hidden = false; $('#pw').focus(); }
+function showLogin() { clearInterval(timer); $('#app').hidden = true; $('#login').hidden = false; ($('#un').value ? $('#pw') : $('#un')).focus(); }
 function showApp() { $('#login').hidden = true; $('#app').hidden = false; }
 
 $('#loginForm').onsubmit = async (e) => {
   e.preventDefault();
   $('#loginErr').textContent = '';
   try {
-    await api('/login', 'POST', { password: $('#pw').value });
+    await api('/login', 'POST', { username: $('#un').value.trim(), password: $('#pw').value });
     $('#pw').value = '';
     await boot();
   } catch (err) { $('#loginErr').textContent = err.message; }

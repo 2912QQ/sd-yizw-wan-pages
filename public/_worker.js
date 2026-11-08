@@ -1,7 +1,8 @@
 // MeshLink — WireGuard 异地组网控制面 (Cloudflare Pages Functions，高级模式 _worker.js + D1)
 //
 // 部署在 Cloudflare Pages：本文件放在构建输出目录 public/ 根下，Pages 会把它当作 Worker 运行；
-// /api/*、/healthz 由本文件处理（见 _routes.json），其余路径是 public/ 里的静态文件。
+// 所有路径都先经过本文件（见 _routes.json）：/api/*、/healthz 由本文件处理，/admin 是后台页面，
+// /agent.sh 等安装脚本是 public/ 里的静态文件，其余路径反向代理到 PROXY_URL。
 //
 // 职责: 管理网络/节点、分配虚拟 IP、为每个节点生成 WireGuard 对端配置。
 // 数据流量由各节点之间的 WireGuard 直连传输，不经过 Cloudflare；
@@ -795,13 +796,15 @@ async function login(request, env) {
   if (r.c >= 5) throw new HttpError(429, '尝试次数过多，请 10 分钟后再试');
   const body = await readJson(request);
   sessionKey(env);
-  const ok = safeEqual(await sha256(String(body.password || '')), await sha256(env.ADMIN_PASSWORD || ''));
-  if (!ok) {
+  // 用户名取环境变量 ADMIN_USERNAME，未设置时默认 admin；用户名和密码都比对，避免泄露哪一项错了
+  const userOk = safeEqual(await sha256(String(body.username || '').trim()), await sha256(env.ADMIN_USERNAME || 'admin'));
+  const passOk = safeEqual(await sha256(String(body.password || '')), await sha256(env.ADMIN_PASSWORD || ''));
+  if (!(userOk && passOk)) {
     await env.DB.batch([
       env.DB.prepare('INSERT INTO login_attempts (ip, ts) VALUES (?,?)').bind(ip, t),
       env.DB.prepare('DELETE FROM login_attempts WHERE ts<?').bind(t - 86400),
     ]);
-    throw new HttpError(401, '密码错误');
+    throw new HttpError(401, '用户名或密码错误');
   }
   await env.DB.prepare('DELETE FROM login_attempts WHERE ip=?').bind(ip).run();
   const exp = t + SESSION_TTL;
@@ -984,6 +987,79 @@ async function handleAdmin(request, env, url) {
   throw new HttpError(404, 'not found');
 }
 
+// ───────────────────────── 反向代理 / 路由 ─────────────────────────
+// 后台只在 /admin 下提供；其余未知路径反向代理到 PROXY_URL（作为门面站点），未设置则返回 404。
+// agent 安装脚本需要 /agent.sh、/meshlink-path.py，仍由静态资源直接提供。
+
+const PUBLIC_ASSETS = new Set(['/agent.sh', '/meshlink-path.py']);
+const REWRITE_TYPES = /^(text\/html|text\/css|(application|text)\/(x-)?javascript)\b/i;
+
+function proxyTarget(env, url) {
+  let base;
+  try { base = new URL(String(env.PROXY_URL || '')); } catch { return null; }
+  if (base.protocol !== 'https:' && base.protocol !== 'http:') return null;
+  if (base.host === url.host) return null; // 防止代理回自己造成死循环
+  return base;
+}
+
+async function reverseProxy(request, env, url) {
+  const base = proxyTarget(env, url);
+  if (!base) return textResp('not found\n', 404);
+
+  const prefix = base.pathname.replace(/\/+$/, '');
+  const upstream = new URL(prefix + url.pathname + url.search, base.origin);
+
+  const headers = new Headers(request.headers);
+  for (const k of [...headers.keys()]) {
+    if (k.startsWith('cf-') || k.startsWith('x-forwarded-') || k === 'x-real-ip') headers.delete(k);
+  }
+  headers.set('Host', base.host);
+  // 不把管理后台会话 Cookie 泄露给上游站点
+  const cookies = (headers.get('Cookie') || '').split(';').map((c) => c.trim()).filter((c) => c && !c.startsWith('mesh_session='));
+  if (cookies.length) headers.set('Cookie', cookies.join('; ')); else headers.delete('Cookie');
+  for (const k of ['Origin', 'Referer']) {
+    const v = headers.get(k);
+    if (v) headers.set(k, v.replace(url.origin, base.origin));
+  }
+
+  const hasBody = request.method !== 'GET' && request.method !== 'HEAD';
+  let resp;
+  try {
+    resp = await fetch(upstream.toString(), { method: request.method, headers, body: hasBody ? request.body : undefined, redirect: 'manual' });
+  } catch {
+    return textResp('bad gateway\n', 502);
+  }
+
+  const out = new Headers(resp.headers);
+  const loc = out.get('Location');
+  if (loc) out.set('Location', loc.split(base.origin).join(url.origin));
+  const sc = typeof resp.headers.getSetCookie === 'function' ? resp.headers.getSetCookie() : [];
+  if (sc.length) {
+    out.delete('Set-Cookie');
+    for (const c of sc) out.append('Set-Cookie', c.replace(/;\s*Domain=[^;]*/i, ''));
+  }
+
+  const ct = out.get('Content-Type') || '';
+  if (request.method !== 'HEAD' && REWRITE_TYPES.test(ct)) {
+    const text = (await resp.text()).split(base.origin).join(url.origin);
+    out.delete('Content-Length');
+    out.delete('Content-Encoding');
+    out.delete('ETag');
+    return new Response(text, { status: resp.status, headers: out });
+  }
+  return new Response(resp.body, { status: resp.status, headers: out });
+}
+
+async function serveAdminPage(request, env, url) {
+  if (request.method !== 'GET' && request.method !== 'HEAD') return textResp('method not allowed\n', 405);
+  if (url.pathname === '/admin') return Response.redirect(url.origin + '/admin/' + url.search, 301);
+  const r = await env.ASSETS.fetch(new Request(url.origin + '/', request));
+  const h = new Headers(r.headers);
+  h.set('Cache-Control', 'no-store');
+  h.set('X-Robots-Tag', 'noindex, nofollow');
+  return new Response(r.body, { status: r.status, headers: h });
+}
+
 // ───────────────────────── 入口 ─────────────────────────
 
 export default {
@@ -993,7 +1069,10 @@ export default {
       if (url.pathname.startsWith('/api/agent/')) return await handleAgent(request, env, url);
       if (url.pathname.startsWith('/api/admin/')) return await handleAdmin(request, env, url);
       if (url.pathname === '/healthz') return textResp('ok v1.0.6\n');
-      return await env.ASSETS.fetch(request);
+      if (url.pathname === '/admin' || url.pathname === '/admin/') return await serveAdminPage(request, env, url);
+      if (PUBLIC_ASSETS.has(url.pathname)) return await env.ASSETS.fetch(request);
+      if (url.pathname.startsWith('/api/')) throw new HttpError(404, 'not found');
+      return await reverseProxy(request, env, url);
     } catch (e) {
       if (e instanceof HttpError) {
         return url.pathname.startsWith('/api/agent/')

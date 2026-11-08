@@ -20,7 +20,7 @@ function makeEnv(schema = readFileSync(new URL('../schema.sql', import.meta.url)
   return {
     db,
     DB: { prepare: (sql) => stmt(sql), batch: async (list) => { for (const s of list) await s.run(); return []; } },
-    ASSETS: { fetch: async () => new Response('asset') },
+    ASSETS: { fetch: async (req) => new Response('asset:' + new URL(req.url).pathname) },
     ADMIN_PASSWORD: 'pw', SESSION_SECRET: 'secret',
     IP_LOOKUP: async () => null,   // 测试里不访问外部 IP 库
   };
@@ -43,7 +43,7 @@ const pubKey = (c) => c.repeat(43) + '=';
 
 async function setup(mode = 'mesh') {
   const env = makeEnv();
-  const login = await call(env, 'POST', '/api/admin/login', { body: { password: 'pw' } });
+  const login = await call(env, 'POST', '/api/admin/login', { body: { username: 'admin', password: 'pw' } });
   assert.equal(login.status, 200);
   const cookie = login.headers.get('set-cookie').split(';')[0];
   const net = (await call(env, 'POST', '/api/admin/networks', { cookie, body: { name: 'lab', cidr: '10.88.0.0/24', mode } })).json.id;
@@ -234,7 +234,7 @@ const addClient = (env, cookie, net, name, c) =>
 
 test('客户端: 没有可用 Hub 时拒绝创建；输入校验', async () => {
   const env = makeEnv();
-  const login = await call(env, 'POST', '/api/admin/login', { body: { password: 'pw' } });
+  const login = await call(env, 'POST', '/api/admin/login', { body: { username: 'admin', password: 'pw' } });
   const cookie = login.headers.get('set-cookie').split(';')[0];
   const net = (await call(env, 'POST', '/api/admin/networks', { cookie, body: { name: 'lab', cidr: '10.88.0.0/24' } })).json.id;
   assert.equal((await addClient(env, cookie, net, 'phone', 'P')).status, 409);
@@ -295,7 +295,7 @@ test('客户端: 中心辐射模式下辐射节点已经通过 netCidr 覆盖客
 test('客户端: 旧库没有 is_client 列时自动补列；换钥匙后公钥更新', async () => {
   const schema = readFileSync(new URL('../schema.sql', import.meta.url), 'utf8').split('\n').filter((l) => !l.includes('is_client')).join('\n');
   const env = makeEnv(schema);
-  const login = await call(env, 'POST', '/api/admin/login', { body: { password: 'pw' } });
+  const login = await call(env, 'POST', '/api/admin/login', { body: { username: 'admin', password: 'pw' } });
   const cookie = login.headers.get('set-cookie').split(';')[0];
   const net = (await call(env, 'POST', '/api/admin/networks', { cookie, body: { name: 'lab', cidr: '10.88.0.0/24' } })).json.id;
   const id = (await call(env, 'POST', `/api/admin/networks/${net}/nodes`, { cookie, body: { name: 'hub1', is_hub: true, endpoint_override: 'hub.example.com' } })).json.id;
@@ -319,7 +319,7 @@ test('客户端: 旧库没有 is_client 列时自动补列；换钥匙后公钥�
 test('设置: 副标题可自定义、可清空，需要登录，超长被拒绝', async () => {
   const env = makeEnv();
   assert.equal((await call(env, 'GET', '/api/admin/settings')).status, 401);
-  const login = await call(env, 'POST', '/api/admin/login', { body: { password: 'pw' } });
+  const login = await call(env, 'POST', '/api/admin/login', { body: { username: 'admin', password: 'pw' } });
   const cookie = login.headers.get('set-cookie').split(';')[0];
   assert.equal((await call(env, 'GET', '/api/admin/settings', { cookie })).json.subtitle, null);
   assert.equal((await call(env, 'PUT', '/api/admin/settings', { cookie, body: { subtitle: '  龍哥的专属组网 ' } })).json.subtitle, '龍哥的专属组网');
@@ -708,7 +708,7 @@ test('出口节点: 旧库没有 exit_via 列时自动补列', async () => {
   const schema = readFileSync(new URL('../schema.sql', import.meta.url), 'utf8').replace(/^\s*exit_via .*\n/m, '');
   assert.doesNotMatch(schema, /exit_via/);
   const env = makeEnv(schema);
-  const login = await call(env, 'POST', '/api/admin/login', { body: { password: 'pw' } });
+  const login = await call(env, 'POST', '/api/admin/login', { body: { username: 'admin', password: 'pw' } });
   const cookie = login.headers.get('set-cookie').split(';')[0];
   const net = (await call(env, 'POST', '/api/admin/networks', { cookie, body: { name: 'lab', cidr: '10.88.0.0/24' } })).json.id;
   const a = (await call(env, 'POST', `/api/admin/networks/${net}/nodes`, { cookie, body: { name: 'a' } })).json.id;
@@ -716,4 +716,61 @@ test('出口节点: 旧库没有 exit_via 列时自动补列', async () => {
   assert.equal((await call(env, 'PUT', `/api/admin/nodes/${a}`, { cookie, body: { exit_via: b } })).status, 200);
   const list = (await call(env, 'GET', `/api/admin/networks/${net}/nodes`, { cookie })).json.nodes;
   assert.equal(list.find((n) => n.id === a).exit_via, b);
+});
+
+
+// ───────────── 用户名登录 / /admin 入口 / 反向代理 ─────────────
+
+test('登录必须同时提供正确的用户名和密码', async () => {
+  const env = makeEnv();
+  const bad = await call(env, 'POST', '/api/admin/login', { body: { username: 'root', password: 'pw' } });
+  assert.equal(bad.status, 401);
+  const noUser = await call(env, 'POST', '/api/admin/login', { body: { password: 'pw' } });
+  assert.equal(noUser.status, 401);
+  const ok = await call(env, 'POST', '/api/admin/login', { body: { username: 'admin', password: 'pw' } });
+  assert.equal(ok.status, 200);
+});
+
+test('ADMIN_USERNAME 可自定义用户名', async () => {
+  const env = makeEnv();
+  env.ADMIN_USERNAME = 'longge';
+  assert.equal((await call(env, 'POST', '/api/admin/login', { body: { username: 'admin', password: 'pw' } })).status, 401);
+  assert.equal((await call(env, 'POST', '/api/admin/login', { body: { username: 'longge', password: 'pw' } })).status, 200);
+});
+
+test('/admin 提供后台页面，/ 不再暴露后台', async () => {
+  const env = makeEnv();
+  const r = await call(env, 'GET', '/admin/');
+  assert.equal(r.status, 200);
+  assert.equal(r.text, 'asset:/');
+  assert.match(r.headers.get('cache-control'), /no-store/);
+  const redir = await worker.fetch(new Request('https://mesh.example/admin'), env);
+  assert.equal(redir.status, 301);
+  assert.equal(redir.headers.get('location'), 'https://mesh.example/admin/');
+  const root = await call(env, 'GET', '/');   // 未配置 PROXY_URL
+  assert.equal(root.status, 404);
+  assert.equal((await call(env, 'GET', '/agent.sh')).text, 'asset:/agent.sh');
+  assert.equal((await call(env, 'GET', '/api/nope')).status, 404);
+});
+
+test('其余路径反向代理到 PROXY_URL，且不泄露后台 Cookie', async () => {
+  const env = makeEnv();
+  env.PROXY_URL = 'https://up.example/base';
+  const seen = [];
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (u, init) => {
+    seen.push({ u: String(u), h: new Headers(init.headers) });
+    return new Response('<a href="https://up.example/x">x</a>', {
+      status: 200, headers: { 'content-type': 'text/html', 'set-cookie': 'a=1; Domain=up.example; Path=/' },
+    });
+  };
+  try {
+    const r = await call(env, 'GET', '/hello?q=1', { cookie: 'mesh_session=SECRET; other=2' });
+    assert.equal(r.status, 200);
+    assert.equal(r.text, '<a href="https://mesh.example/x">x</a>');
+    assert.equal(seen[0].u, 'https://up.example/base/hello?q=1');
+    assert.equal(seen[0].h.get('host'), 'up.example');
+    assert.equal(seen[0].h.get('cookie'), 'other=2');
+    assert.ok(!/domain/i.test(r.headers.get('set-cookie')));
+  } finally { globalThis.fetch = realFetch; }
 });
